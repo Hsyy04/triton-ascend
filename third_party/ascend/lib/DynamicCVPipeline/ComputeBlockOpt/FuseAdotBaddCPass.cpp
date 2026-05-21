@@ -83,12 +83,45 @@ private:
         return singleUser;
     }
 
+    int getLoopCarriedArgIndex(Value operand, Block *block)
+    {
+        auto barg = dyn_cast<BlockArgument>(operand);
+        if (!barg || barg.getOwner() != block || !isa<scf::ForOp>(block->getParentOp())) {
+            return -1;
+        }
+        unsigned argIdx = barg.getArgNumber();
+        if (argIdx == 0) {
+            return -1;
+        }
+        return argIdx;
+    }
+
+    bool isOnlyUser(Operation *user, Operation *producer) {
+        auto users = producer->getResult(0).getUsers();
+        return std::distance(users.begin(), users.end()) == 1 && *users.begin() == user;
+    }
+
     bool canFuse(FuseInfo &fuseInfo) {
         // Get the defining operation of 'other'
         Operation *defOp = fuseInfo.other.getDefiningOp();
         if (!defOp) {
-            LOG_DEBUG("Other operand is not defined by any operation, cannot fuse.");
-            return false;
+            // Case3: L0A optimization. all data in scf.for
+            // fuseInfo is the args of scf.for,
+            auto argsIdx = getLoopCarriedArgIndex(fuseInfo.other, fuseInfo.matmul->getBlock());
+            if (argsIdx == -1) {
+                LOG_DEBUG("Other operand is not defined by any operation, cannot fuse.");
+                return false;
+            }
+            auto yieldOp = fuseInfo.matmul->getBlock()->getTerminator();
+            auto yieldedVal = yieldOp->getOperand(argsIdx - 1);
+            auto yieldedDefOp = yieldedVal.getDefiningOp();
+            if (yieldedDefOp == fuseInfo.addOp) {
+                return true;
+            } else {
+                LOG_DEBUG("Other operand is a loop-carried dependency but not from matmul, cannot fuse.");
+                return false;
+            }
+
         }
 
         // Check the add's result is used by other matmul.
