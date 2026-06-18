@@ -537,8 +537,9 @@ static std::optional<SplitInfo> shouldSplit(linalg::MatmulOp matmulOp)
     return SplitInfo {mayNotExec, outerInValue, outerOutValue, true};
 }
 
-static void splitMatmul(linalg::MatmulOp matmulOp, PatternRewriter &rewriter, SplitInfo splitInfo)
+static void splitMatmul(linalg::MatmulOp matmulOp, PatternRewriter &rewriter, SplitInfo splitInfo, Operation *addPoint)
 {
+
     auto outputType = dyn_cast<RankedTensorType>(parseMatmulInputs(matmulOp).bias.getType());
     if (!outputType) {
         LOG_DEBUG("Not tensor mode: " << matmulOp
@@ -561,7 +562,7 @@ static void splitMatmul(linalg::MatmulOp matmulOp, PatternRewriter &rewriter, Sp
     }
     auto emptyOp = rewriter.create<tensor::EmptyOp>(loc, outputType, dynamicSizes);
     splitInfo.outerInValue.replaceUsesWithIf(emptyOp->getResult(0),
-                                             [&](OpOperand &opop) { return opop.getOwner() == outerDefOp; });
+                                           [&](OpOperand &opop) { return opop.getOwner() == outerDefOp; });
 
     // [Step 2] Create new matmul using zero-filled tensor as accumulator
     // New matmul runs entirely on CUBE with no VECTOR dependency
@@ -580,7 +581,11 @@ static void splitMatmul(linalg::MatmulOp matmulOp, PatternRewriter &rewriter, Sp
 
     // [Step 3] Create add: add(new_matmul_result, outs_value)
     // This is the "c" in a*b+c, added after the matmul result
-    rewriter.setInsertionPointAfterValue(splitInfo.outerOutValue);
+    if (addPoint) {
+        rewriter.setInsertionPoint(addPoint);
+    } else {
+        rewriter.setInsertionPointAfterValue(splitInfo.outerOutValue);
+    }
     Operation *addOp;
     if (isa<FloatType>(elmType)) {
         addOp = rewriter.create<arith::AddFOp>(loc, splitInfo.outerOutValue, splitInfo.outerInValue).getOperation();
@@ -589,8 +594,7 @@ static void splitMatmul(linalg::MatmulOp matmulOp, PatternRewriter &rewriter, Sp
     }
     addOp->setAttr(CVPipeline::kAddFromMatmul, rewriter.getUnitAttr());
     splitInfo.outerOutValue.replaceUsesWithIf(addOp->getResult(0),
-                                              [&](OpOperand &opop) { return opop.getOwner() != addOp; });
-
+                                           [&](OpOperand &opop) { return opop.getOwner() != addOp; });
     rewriter.replaceOp(matmulOp, newMatmul);
 }
 
@@ -611,12 +615,8 @@ LogicalResult SplitMatmulPattern::matchAndRewrite(linalg::MatmulOp matmulOp, Pat
     LOG_DEBUG("-------------------");
     matmulOp->setAttr(CVPipeline::kLoopCarriedL0C, rewriter.getUnitAttr());
 
-    if (splitInfo.shouldSplit) {
-        splitMatmul(matmulOp, rewriter, splitInfo);
-    }
-
-    if (splitInfo.mayNotExec) {
-        matmulOp->setAttr(CVPipeline::kMayNotExec, rewriter.getUnitAttr());
+    if (splitInfo.shouldSplit ) {
+        splitMatmul(matmulOp, rewriter, splitInfo, nullptr);
     }
     return success();
 }

@@ -52,19 +52,6 @@ void StandardizeOpPass::runOnOperation()
         LOG_DEBUG("Pipeline Failed!");
         signalPassFailure();
     }
-
-    bool findMayNotExec = false;
-    op->walk([&](linalg::MatmulOp matmulOp) {
-        if (matmulOp->hasAttr(CVPipeline::kMayNotExec)) {
-            findMayNotExec = true;
-        }
-    });
-
-    if (findMayNotExec) {
-        LOG_DEBUG("Matmul may not execute!");
-        CVPipeline::setFallbackAttr(op);
-        signalPassFailure();
-    }
 }
 
 std::unique_ptr<OperationPass<ModuleOp>> createStandardizeOpPass()
