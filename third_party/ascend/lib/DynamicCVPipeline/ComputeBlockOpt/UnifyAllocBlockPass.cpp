@@ -267,6 +267,42 @@ static FillInfo splitSCFIfIfNeeded(FillInfo &info) {
 }
 
 /**
+ * @brief Collect source view chain ops from memref.copy's source operand
+ *
+ * For each memref.copy found by penetrating ViewLike direct users (subview of
+ * alloc), trace back the copy's source operand along the ViewLikeOpInterface
+ * chain (e.g., memref.subview -> memref.reinterpret_cast), and collect all
+ * ViewLike ops in the chain. These ops will be unified to the same block_id
+ * as the copy.
+ *
+ * @param directUsers Direct users of alloc result (containing ViewLike ops
+ *                    whose users include memref.copy)
+ * @return SmallVector<Operation*> Collected source view chain ops
+ *
+ */
+static SmallVector<Operation *> collectSourceViewChainOps(ArrayRef<Operation *> directUsers) {
+  SmallVector<Operation *> chainOps;
+  for (Operation *op : directUsers) {
+    if (!isa<ViewLikeOpInterface>(op)) {
+      continue;
+    }
+    for (auto *user : op->getUsers()) {
+      auto copyOp = dyn_cast<memref::CopyOp>(user);
+      if (!copyOp) {
+        continue;
+      }
+      // Trace back the copy's source along the view-like chain
+      Value cur = copyOp.getSource();
+      while (auto viewOp = cur.getDefiningOp<ViewLikeOpInterface>()) {
+        chainOps.push_back(viewOp);
+        cur = viewOp.getViewSource();
+      }
+    }
+  }
+  return chainOps;
+}
+
+/**
  * @brief Try to unify block_id for a single alloc operation
  *
  * @param allocOp The memref.alloc operation to process
@@ -308,13 +344,27 @@ tryUnifyForAlloc(memref::AllocOp allocOp,
     fillInfo = splitSCFIfIfNeeded(fillInfo);
   }
 
-  // Step5: Cycle detection and block_id assignment
+  // Step5: Collect source view chain ops from memref.copy's source subview.
+  // Trace back from each copy's source operand along the ViewLikeOpInterface
+  // chain (e.g., subview -> reinterpret_cast) so that the source data
+  // preparation and the copy itself land in the same block.
+  SmallVector<Operation *> sourceViewChainOps = collectSourceViewChainOps(directUsers);
+
+  // Step6: Collect predecessor_ops for scf.if condition
+  // SmallVector<Operation *> conditionOps =
+  //     collectBlockPredecessors(fillInfo.parentIf.getCondition(), fillInfo.parentIf->getBlock());
+
+  // Step7: Cycle detection and block_id assignment with fallback
   SmallVector<Operation *> coreOps = {
       allocOp.getOperation(),
       fillInfo.fillOp.getOperation(),
       fillInfo.parentIf.getOperation(),
   };
   coreOps.append(directUsers);
+  coreOps.append(sourceViewChainOps);
+  SmallVector<Operation *> allOps = coreOps;
+  // allOps include coreOps and scf.if_condition's predecessor_ops
+  // allOps.append(conditionOps);
 
   if (CVPipeline::willCreateCycle(coreOps, memGraph, targetBlockId, bm)) {
     LOG_DEBUG(
@@ -327,6 +377,7 @@ tryUnifyForAlloc(memref::AllocOp allocOp,
   LOG_DEBUG("[tryUnifyForAlloc] Successfully unify block_id to "
             << targetBlockId << " for allocOp: " << *allocOp);
   return success();
+  LOG_DEBUG("Successfully Unify AllocOp: " << *allocOp << " to blockId: " << targetBlockId << "\n");
 }
 
 } // anonymous namespace
