@@ -38,6 +38,7 @@ void AddBlockIdForControlOpsPass::runOnOperation()
 {
   LOG_DEBUG("\n--- enter AddBlockIdForControlOpsPass --->\n");
   ModuleOp module = getOperation();
+  LOG_DEBUG("input mlir: \n"<< module << "\n");
 
   // Step 1: find the max block_id
   int maxBlockId = CVPipeline::getAvailableBlockId(module) - 1;

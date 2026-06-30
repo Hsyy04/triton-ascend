@@ -461,13 +461,16 @@ static bool shouldSplitByInput(linalg::MatmulOp matmulOp, Value &outerOutValue, 
         LOG_DEBUG("Not split because bias is zero. " << matmulOp);
         return false;
     }
+    if (CVPipeline::isSmallBroadcastOp(outerInValue.getDefiningOp())) {
+        LOG_DEBUG("Not split because broadcast bias is small. " << matmulOp);
+        return false;
+    }
     auto defMatmul =
         dyn_cast_if_present<linalg::MatmulOp>(hivm::traceDefOp<linalg::MatmulOp>(outerInValue).value_or(nullptr));
     if (defMatmul) {
         LOG_DEBUG("Not split because L0C remain. " << matmulOp);
         return false;
     }
-    // from broadcast [N]->[M, N] // S11 S12 S19 S20
     return true;
 }
 
