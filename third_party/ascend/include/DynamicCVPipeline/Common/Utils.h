@@ -56,6 +56,7 @@ inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
 inline constexpr llvm::StringLiteral kFlowOpt = "ssbuffer.flowOpt";
 static constexpr llvm::StringLiteral kInlinableQuantScaleAttr = "enable_fast_tf32_mul";
 inline constexpr llvm::StringLiteral kHIVMMatmulLimitedInCubeAttr = "hivm.matmul_limited_in_cube";
+inline constexpr llvm::StringLiteral kUsedInMmadBias = "ssbuffer.used_in_mmad_bias";
 
 inline constexpr const char *ERRCODE_ATTR = "triton_ascend.dynamic_cv_pipeline.rc";
 static constexpr const int ERRCODE_FAILED = 1;
@@ -98,6 +99,10 @@ inline bool isCubeOp(Operation *op)
 }
 
 bool isVectorOnlyOp(Operation *op);
+
+bool allResultHasOneUser(Operation *op);
+
+bool isSmallBroadcastOp(Operation *op);
 
 } // namespace CVPipeline
 } // namespace mlir

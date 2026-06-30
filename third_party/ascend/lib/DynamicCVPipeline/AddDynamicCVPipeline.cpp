@@ -97,7 +97,7 @@ void AddDynamicCVPipelinePass::runOnOperation()
     pm.addPass(createSeparateMemoryFromComputePass());
     pm.addPass(createAllocMultiCachePass());
     pm.addPass(createAddControlFlowConditionPass());
-    pm.addPass(createRemoveSsbufAttrPass());
+    // pm.addPass(createRemoveSsbufAttrPass());
 
     if (failed(runPipeline(pm, moduleOp))) {
         auto errCodeAttr = moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);

@@ -90,7 +90,8 @@ class OpClassifierPass : public PassWrapper<OpClassifierPass, OperationPass<Modu
     void matchTransposePattern(Operation *def);
     void matchFillPattern(Operation *def);
     void matchEmptyPattern(Operation *def);
-
+    void matchBroadcastPattern(Operation *def);
+    Value extractMmadBiasFromPotentialUnitDimExpand(Value bias);
     // Downstream pattern matching helpers
     void matchStorePattern(Operation *user);
     void matchExtractSlicePattern(Operation *user);
