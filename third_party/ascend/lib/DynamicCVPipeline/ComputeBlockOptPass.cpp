@@ -26,6 +26,7 @@
 #include "DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/BroadcastUBOpt.h"
 
 #include "mlir/Pass/PassManager.h"
 
@@ -63,6 +64,8 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createFixpipeOptPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
+  pm.addPass(createBroadcastUBOptPass());
+
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
       CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
@@ -88,6 +91,7 @@ void registerComputeBlockOptPasses() {
   registerPass(createMergeCubeForBlockPass);
   registerPass(createFixpipeOptPass);
   registerPass(createUnifyStoreBlockPass);
+  registerPass(createBroadcastUBOptPass);
 }
 
 } // namespace triton
