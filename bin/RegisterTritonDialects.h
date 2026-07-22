@@ -6,6 +6,7 @@
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache/AddMultiBufferOuterScope.h"
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/BroadcastUBOpt.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
 #include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AddMultiBufferToGMLoadPass.h"
@@ -191,6 +192,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerAnalyzeDataFlowPasses();
   mlir::triton::registerComputeBlockOptPasses();
   mlir::triton::registerPlanComputeBlockPasses();
+  mlir::triton::registerBroadcastUBOptPasses();
   mlir::triton::registerOpClassifierPass();
   mlir::triton::registerRefineArgsBlockIdPasses();
   mlir::triton::registerSinkI1ProducersIntoUsersPasses();

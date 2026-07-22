@@ -27,6 +27,7 @@
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/SinkI1Producers.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/BroadcastUBOpt.h"
 
 #include "mlir/Pass/PassManager.h"
 
@@ -71,6 +72,7 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createSinkI1ProducersIntoUsersPass());
+  pm.addPass(createBroadcastUBOptPass());
 
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
@@ -100,6 +102,7 @@ void registerComputeBlockOptPasses() {
   registerPass(createSinkI1ProducersIntoUsersPass);
   registerPass(createIterVarOptPass);
   registerPass(createMergeSmallBlockPass);
+  registerPass(createBroadcastUBOptPass);
 }
 
 } // namespace triton
