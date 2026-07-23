@@ -401,32 +401,6 @@ extractToProcessFromFuseGroup(Block *block,
     }
   }
 
-  for (auto op : nowFuseGroup) {
-    for (auto result : op->getResults()) {
-      if (auto tensorType = dyn_cast<mlir::TensorType>(result.getType())) {
-        mlir::Type elemType = tensorType.getElementType();
-        if (!elemType.isInteger(1)) {
-          continue;
-        }
-      }
-      bool hasExternalUser = false;
-      for (auto user : result.getUsers()) {
-        if (!llvm::is_contained(nowFuseGroup, user)) {
-          hasExternalUser = true;
-          break;
-        }
-      }
-      if (hasExternalUser) {
-        collectAllUsersInFuseGroup(op, nowFuseGroup, toRemove);
-        for (auto operand : op->getOperands()) {
-          if (auto definingOp = operand.getDefiningOp()) {
-            collectAllDependenciesInFuseGroup(definingOp, nowFuseGroup,
-                                              toRemove);
-          }
-        }
-      }
-    }
-  }
   for (auto op : toRemove) {
     LOG_DEBUG("Removing op when refining: " << *op << "\n");
     toProcess.erase(std::remove(toProcess.begin(), toProcess.end(), op),
@@ -494,14 +468,14 @@ void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
                      SmallVector<Operation *> &candidates,
                      DenseMap<Operation *, int> &indegree,
                      const CVPipeline::MemoryDependenceGraph &memGraph,
-                     ComputeBlockIdManager &bm, bool isUBRefineOptEnabled) {
+                     ComputeBlockIdManager &bm) {
   // 1.Find ops in fuse group whose next node is a non-fusable (CUBE-only) op
   auto toProcess =
       findOpsAdjacentToCube(block, nowFuseGroup, visited, memGraph);
 
   // 2. If no cube adjacent op, extract toProcess from fuseGroup using fallback
   // rules
-  if (toProcess.empty() && isUBRefineOptEnabled) {
+  if (toProcess.empty()) {
     LOG_DEBUG("No Cube adjacent op, extracting toProcess from fuseGroup.\n");
     toProcess = extractToProcessFromFuseGroup(block, nowFuseGroup, bm);
   }
@@ -528,7 +502,7 @@ void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
 llvm::LogicalResult
 planVectorBlockId(Block *block,
                   const CVPipeline::MemoryDependenceGraph &memGraph,
-                  ComputeBlockIdManager &bm, bool isUBRefineOptEnabled) {
+                  ComputeBlockIdManager &bm) {
   // 1. topo initialize
   llvm::DenseMap<Operation *, int> indegree;
   llvm::SmallVector<Operation *> queue;
@@ -564,7 +538,7 @@ planVectorBlockId(Block *block,
       // finish one group, assign block id and start next iteration
       // Cut error operations before assigning block id
       refineFuseGroup(block, nowFuseGroup, visited, queue, indegree, memGraph,
-                      bm, isUBRefineOptEnabled);
+                      bm);
       LOG_DEBUG("Group after cutting: \n");
       for (auto op : nowFuseGroup) {
         LOG_DEBUG("fuseing: " << *op << "\n");
@@ -592,16 +566,11 @@ void PlanVectorBlockPass::runOnOperation() {
   auto &aa = getAnalysis<AliasAnalysis>();
   auto memDepGraph = MemoryDependenceGraph(moduleOp, aa);
   auto bm = ComputeBlockIdManager(moduleOp);
-  bool isUBRefineOptEnabled = false;
-  auto attr = moduleOp->getAttr(CVPipeline::kEnableUbRefineOpt);
-  if (attr) {
-    isUBRefineOptEnabled = true;
-  }
 
   // 2. search blocks in topo order and assign block id for each block
   auto result = moduleOp.walk([&](Block *block) -> WalkResult {
     if (llvm::failed(
-            planVectorBlockId(block, memDepGraph, bm, isUBRefineOptEnabled))) {
+            planVectorBlockId(block, memDepGraph, bm))) {
       return WalkResult::interrupt();
     }
     return WalkResult::advance();
