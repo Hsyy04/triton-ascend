@@ -838,6 +838,10 @@ UBUsageOptPass::optBroadcast(Block *block,
   return llvm::success();
 }
 
+
+/**
+
+ */
 llvm::LogicalResult
 UBUsageOptPass::optSmallBlock(Block *block,
                               const CVPipeline::MemoryDependenceGraph &memGraph,
