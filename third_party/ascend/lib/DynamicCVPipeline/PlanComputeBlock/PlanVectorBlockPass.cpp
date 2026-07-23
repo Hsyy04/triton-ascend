@@ -207,43 +207,63 @@ void findCandidates(DenseMap<Operation *, int> &indegree,
   }
 }
 
-static SmallVector<Operation *>
-findOpsAdjacentToCube(Block *block, const SmallVector<Operation *> &fuseGroup,
-                      DenseMap<Operation *, bool> &visited,
-                      const CVPipeline::MemoryDependenceGraph &memGraph) {
-  SmallVector<Operation *> toProcess;
-  std::optional<int> blockId;
-  for (Operation *op : fuseGroup) {
-    SmallVector<Operation *> allUsers;
-    allUsers.append(op->getUsers().begin(), op->getUsers().end());
-    for (auto memUser : memGraph.getExecAfter(op)) {
-      allUsers.push_back(memUser);
-    }
+static SmallVector<Operation *> findOpsAdjacentToCube(Block *block, const SmallVector<Operation *> &fuseGroup,
+                                                      DenseMap<Operation *, bool> &visited,
+                                                      const CVPipeline::MemoryDependenceGraph &memGraph,
+                                                      CVPipeline::ComputeBlockIdManager &bm)
+{
+    SmallVector<Operation *> toProcess;
+    std::optional<int> minBlockId = std::nullopt;
 
-    for (auto user : allUsers) {
-      auto userInBlock = CVPipeline::getAncestorInBlock(user, block);
-      if (!userInBlock || (block->mightHaveTerminator() &&
-                           userInBlock == block->getTerminator())) {
-        continue;
-      }
-      if (!isFusableOp(userInBlock) && !visited[userInBlock]) {
-        auto newBlockId = getOpBlockId(user);
-        if (!newBlockId.has_value()) {
-          newBlockId =
-              getOpBlockId(userInBlock); // Some op will be tagged outside
+    for (Operation *op : fuseGroup) {
+        SmallVector<Operation *> allUsers;
+        allUsers.append(op->getUsers().begin(), op->getUsers().end());
+        for (auto memUser : memGraph.getExecAfter(op)) {
+            allUsers.push_back(memUser);
         }
 
-        if (!blockId.has_value()) {
-          blockId = newBlockId;
+        for (auto user : allUsers) {
+            auto userInBlock = CVPipeline::getAncestorInBlock(user, block);
+            if (!userInBlock || (block->mightHaveTerminator() && userInBlock == block->getTerminator())) {
+                continue;
+            }
+            if (!isFusableOp(userInBlock) && !visited[userInBlock]) {
+                auto newBlockId = bm.getBlockIdByOp(userInBlock);
+                if (!minBlockId.has_value() || newBlockId < minBlockId) {
+                    minBlockId = newBlockId;
+                }
+            }
         }
-        if (!newBlockId.has_value() || blockId == newBlockId) {
-          toProcess.push_back(op);
-        }
-      }
     }
-  }
-  return toProcess;
+
+    if (!minBlockId.has_value()) {
+        return {};
+    }
+
+    for (Operation *op : fuseGroup) {
+        SmallVector<Operation *> allUsers;
+        allUsers.append(op->getUsers().begin(), op->getUsers().end());
+        for (auto memUser : memGraph.getExecAfter(op)) {
+            allUsers.push_back(memUser);
+        }
+
+        for (auto user : allUsers) {
+            auto userInBlock = CVPipeline::getAncestorInBlock(user, block);
+            if (!userInBlock || (block->mightHaveTerminator() && userInBlock == block->getTerminator())) {
+                continue;
+            }
+            if (!isFusableOp(userInBlock) && !visited[userInBlock]) {
+                auto newBlockId = bm.getBlockIdByOp(userInBlock);
+                if (newBlockId == minBlockId) {
+                    toProcess.push_back(op);
+                    break;
+                }
+            }
+        }
+    }
+    return toProcess;
 }
+
 
 static int getLoopCarriedArgIndex(Value operand, Block *block) {
   auto barg = dyn_cast<BlockArgument>(operand);
@@ -471,7 +491,7 @@ void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
                      ComputeBlockIdManager &bm) {
   // 1.Find ops in fuse group whose next node is a non-fusable (CUBE-only) op
   auto toProcess =
-      findOpsAdjacentToCube(block, nowFuseGroup, visited, memGraph);
+      findOpsAdjacentToCube(block, nowFuseGroup, visited, memGraph, bm);
 
   // 2. If no cube adjacent op, extract toProcess from fuseGroup using fallback
   // rules
