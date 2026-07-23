@@ -52,7 +52,7 @@ void BroadcastUBOptPass::runOnOperation()
     CVPipeline::ComputeBlockIdManager bm(moduleOp);
 
     moduleOp.walk([&](Operation *op) {
-        if (!isa<BroadcastOp>(op))
+        if (!isa<linalg::BroadcastOp>(op))
             return;
 
         SmallVector<Operation *> users(op->getUsers().begin(), op->getUsers().end());
