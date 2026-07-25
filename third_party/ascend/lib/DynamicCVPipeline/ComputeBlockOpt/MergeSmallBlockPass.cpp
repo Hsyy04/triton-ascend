@@ -23,6 +23,7 @@
 #include "DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Common.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "mlir/Analysis/AliasAnalysis.h"
@@ -30,9 +31,11 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include <optional>
+#include <utility>
 
 static constexpr const char *DEBUG_TYPE = "merge-small-block";
 #define LOG_DEBUG(...)                                                         \
@@ -89,6 +92,7 @@ getUpBlock(int nowBlockId, Block *block,
   auto ops = bm.getOpsByBlockId(nowBlockId);
   llvm::SmallDenseSet<int> upstreamIds;
   llvm::SmallVector<std::pair<Operation*, Operation *>> boundaryPairs;
+  bool hasCubeDef = false;
 
   for (Operation *op : ops) {
     for (Value operand : op->getOperands()) {
@@ -100,6 +104,10 @@ getUpBlock(int nowBlockId, Block *block,
       if (!defInBlock) {
         continue;
       }
+      if (CVPipeline::getOpCoreType(defInBlock) != CVPipeline::CoreType::VECTOR_ONLY) {
+        hasCubeDef = true;
+        break;
+      }
       int bid = bm.getBlockIdByOp(defInBlock);
       if (bid != -1 && bid != nowBlockId) {
         upstreamIds.insert(bid);
@@ -108,11 +116,15 @@ getUpBlock(int nowBlockId, Block *block,
     }
   }
 
+  if (hasCubeDef) {
+    return std::nullopt;
+  }
+
   if (upstreamIds.size() != 1) {
     return std::nullopt;
   }
 
-  if (llvm::all_of(boundaryPairs, [&](std::pair<Operation*, Operation *> pr) {
+  if (llvm::any_of(boundaryPairs, [&](std::pair<Operation*, Operation *> pr) {
         auto defOp = pr.first;
         auto userOp = pr.second;
         return isShapeChangeOp(defOp) || isShapeChangeOp(userOp);
@@ -130,6 +142,7 @@ getDownBlock(int nowBlockId, Block *block,
   auto ops = bm.getOpsByBlockId(nowBlockId);
   llvm::SmallDenseSet<int> downstreamIds;
   llvm::SmallVector<std::pair<Operation*, Operation *>> boundaryPairs;
+  bool hasCubeUser = false;
 
   for (Operation *op : ops) {
     for (Value result : op->getResults()) {
@@ -137,6 +150,10 @@ getDownBlock(int nowBlockId, Block *block,
         Operation *userInBlock = CVPipeline::getAncestorInBlock(user, block);
         if (!userInBlock) {
           continue;
+        }
+        if (CVPipeline::getOpCoreType(userInBlock) != CVPipeline::CoreType::VECTOR_ONLY) {
+          hasCubeUser = true;
+          break;
         }
         int bid = bm.getBlockIdByOp(userInBlock);
         if (bid != -1 && bid != nowBlockId) {
@@ -147,11 +164,15 @@ getDownBlock(int nowBlockId, Block *block,
     }
   }
 
+  if (hasCubeUser) {
+    return std::nullopt;
+  }
+
   if (downstreamIds.size() != 1) {
     return std::nullopt;
   }
 
-  if (llvm::all_of(boundaryPairs, [&](std::pair<Operation*, Operation *> pr) {
+  if (llvm::any_of(boundaryPairs, [&](std::pair<Operation*, Operation *> pr) {
         auto defOp = pr.first;
         auto userOp = pr.second;
         return isShapeChangeOp(defOp) || isShapeChangeOp(userOp);
@@ -221,27 +242,38 @@ public:
         if (ops.size() > MIN_VF_SIZE || ops.empty()) {
           continue;
         }
+        if (CVPipeline::getOpCoreType(*ops.begin()) != CVPipeline::CoreType::VECTOR_ONLY) {
+          continue;
+        }
 
         LOG_DEBUG("Processing small block " << nowBlockId << " ("
                                             << ops.size() << " ops)");
 
         auto upBlock = getUpBlock(nowBlockId, block, bm);
         if (upBlock.has_value()) {
-          LOG_DEBUG("Merging block " << nowBlockId << " into upstream block "
-                                     << upBlock.value());
-          for (Operation *op : ops) {
-            bm.updateBlockId(op, upBlock.value());
+          if (CVPipeline::willCreateCycle(ops, memGraph, upBlock.value(), bm)) {
+            LOG_DEBUG("would create cycle, skip\n");
+          } else {
+            LOG_DEBUG("Merging block " << nowBlockId << " into upstream block "
+                                       << upBlock.value());
+            for (Operation *op : ops) {
+              bm.updateBlockId(op, upBlock.value());
+            }
+            continue;
           }
-          continue;
         }
 
         auto downBlock = getDownBlock(nowBlockId, block, bm);
         if (downBlock.has_value()) {
+          if (CVPipeline::willCreateCycle(ops, memGraph, downBlock.value(), bm)) {
+            LOG_DEBUG("would create cycle, skip\n");
+            continue;
+          }
           LOG_DEBUG("Merging downstream block " << downBlock.value()
                                                 << " into block "
                                                 << nowBlockId);
-          for (Operation *op : bm.getOpsByBlockId(downBlock.value())) {
-            bm.updateBlockId(op, nowBlockId);
+          for (Operation *op : ops) {
+            bm.updateBlockId(op, downBlock.value());
           }
         }
       }

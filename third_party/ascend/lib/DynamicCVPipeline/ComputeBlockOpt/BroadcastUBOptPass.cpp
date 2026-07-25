@@ -28,7 +28,6 @@
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Operation.h"
@@ -93,6 +92,10 @@ void BroadcastUBOptPass::runOnOperation() {
     int broadcastBlockId = bm.getBlockIdByOp(op);
     if (broadcastBlockId == firstUserBlockId) {
       LOG_DEBUG("broadcast already in same block, skip\n");
+      return;
+    }
+
+    if (op->getBlock() != users.front()->getBlock()) {
       return;
     }
 
