@@ -31,6 +31,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -67,10 +68,8 @@ namespace {
 static bool isI1Producer(Operation *op) {
   for (auto result : op->getResults()) {
     if (auto tensorType = dyn_cast<mlir::TensorType>(result.getType())) {
-      mlir::Type elemType = tensorType.getElementType();
-      if (elemType.isInteger(1)) {
+      if (tensorType.getElementType().isInteger(1))
         return true;
-      }
     }
   }
   return false;
@@ -108,53 +107,46 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
   });
 
   for (Operation *p : producers) {
-    SmallVector<std::pair<OpOperand *, unsigned>> i1Uses;
+    bool hasSameBlockUser = false;
+
     for (OpOperand &use : p->getUses()) {
       Type t = use.get().getType();
-      bool isi1 = false;
       if (auto tensorType = dyn_cast<mlir::TensorType>(t)) {
         mlir::Type elemType = tensorType.getElementType();
         if (elemType.isInteger(1)) {
-          isi1 = true;
+          Operation *consumer = use.getOwner();
+          if (bm.isSameBlock(p, consumer)) {
+            hasSameBlockUser = true;
+            continue;
+          }
+
+          unsigned idx = 0;
+          for (unsigned i = 0; i < p->getNumResults(); ++i) {
+            if (p->getResult(i) == use.get()) {
+              idx = i;
+              break;
+            }
+          }
+
+          int consumerBlockId = bm.getBlockIdByOp(consumer);
+          SmallVector<Operation *> opsToCheck = {p};
+          if (CVPipeline::willCreateCycle(opsToCheck, memGraph, consumerBlockId, bm)) {
+            LOG_DEBUG("would create cycle, skip\n");
+            continue;
+          }
+
+          Operation *cloned = p->clone();
+          consumer->getBlock()->push_back(cloned);
+          cloned->moveBefore(consumer);
+          if (consumerBlockId != -1) {
+            cloned->setAttr(mlir::CVPipeline::kBlockId,
+                            mlir::IntegerAttr::get(
+                                mlir::IntegerType::get(p->getContext(), 32),
+                                consumerBlockId));
+          }
+          consumer->getOpOperand(use.getOperandNumber()).set(cloned->getResult(idx));
         }
       }
-      if (isi1) {
-        unsigned idx = use.getOperandNumber();
-        i1Uses.push_back({&use, idx});
-      }
-    }
-
-    if (i1Uses.empty()) {
-      p->erase();
-      continue;
-    }
-
-    bool hasSameBlockUser = false;
-
-    for (auto [use, resultIdx] : i1Uses) {
-      Operation *consumer = use->getOwner();
-
-      if (bm.isSameBlock(p, consumer)) {
-        hasSameBlockUser = true;
-        continue;
-      }
-
-      int consumerBlockId = bm.getBlockIdByOp(consumer);
-      SmallVector<Operation *> opsToCheck = {p};
-      if (CVPipeline::willCreateCycle(opsToCheck, memGraph, consumerBlockId, bm)) {
-        LOG_DEBUG("would create cycle, skip\n");
-        continue;
-      }
-      Operation *cloned = p->clone();
-      consumer->getBlock()->push_back(cloned);
-      cloned->moveBefore(consumer);
-      if (consumerBlockId != -1) {
-        cloned->setAttr(mlir::CVPipeline::kBlockId,
-                        mlir::IntegerAttr::get(
-                            mlir::IntegerType::get(p->getContext(), 32),
-                            consumerBlockId));
-      }
-      use->set(cloned->getResult(resultIdx));
     }
 
     if (!hasSameBlockUser && p->use_empty())

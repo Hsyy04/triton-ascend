@@ -26,6 +26,7 @@
 #include "DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
 
 #include "mlir/Pass/PassManager.h"
 
@@ -67,7 +68,6 @@ void ComputeBlockOptPass::runOnOperation() {
 
   pm.addPass(createFixpipeOptPass());
   pm.addPass(createReorderOpsByBlockIdPass());
-
 
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
