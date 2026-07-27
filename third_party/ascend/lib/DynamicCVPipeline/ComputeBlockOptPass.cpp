@@ -49,6 +49,7 @@ void ComputeBlockOptPass::runOnOperation() {
    */
   pm.addPass(createUnifyAllocBlockPass());
   pm.addPass(createUnifyStoreBlockPass());
+  pm.addPass(createMoveLoadIntoUserPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createMergeVectorIfBlockPass());
@@ -98,6 +99,7 @@ void registerComputeBlockOptPasses() {
   registerPass(createIterVarOptPass);
   registerPass(createMergeSmallBlockPass);
   registerPass(createBroadcastUBOptPass);
+  registerPass(createMoveLoadIntoUserPass);
 }
 
 } // namespace triton

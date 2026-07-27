@@ -20,23 +20,19 @@
  * THE SOFTWARE.
  */
 
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <optional>
 
-#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
@@ -50,7 +46,6 @@
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
-#include "triton/Analysis/Utility.h"
 
 #define DEBUG_TYPE "fixpipe-opt"
 #define LOG_DEBUG(msg)                                                         \
@@ -90,8 +85,6 @@ private:
   bool applyFixpipeOpt(SetVector<Operation *> &matchedOps,
                        const CVPipeline::MemoryDependenceGraph &memGraph,
                        CVPipeline::ComputeBlockIdManager &bm);
-  bool isSubviewFromGlobalMemory(ViewLikeOpInterface viewOp,
-                                 SetVector<Operation *> &matchedOps);
   bool isValidTrunc(Operation *op);
   bool isValidMul(Operation *op, Value matmulValues,
                   SetVector<Operation *> &matchedOps);
@@ -321,41 +314,6 @@ bool FixpipeOptPass::isValidMul(Operation *op, Value matmulValue,
   return false;
 }
 
-bool FixpipeOptPass::isSubviewFromGlobalMemory(
-    ViewLikeOpInterface viewOp, SetVector<Operation *> &matchedOps) {
-  // Subview ops may be nested many layers deep through reinterpretation or
-  // other subviews. like, subview (subview (reinterpret_cast (subview
-  // (reinterpret_cast (arg0))))) so we need Search and only keep same block
-  // view-like op.
-  Value source = viewOp.getViewSource();
-  auto block = viewOp->getBlock();
-  while (true) {
-    LOG_DEBUG("Check view source: " << source << "\n");
-    if (auto blockArg = dyn_cast<BlockArgument>(source)) {
-      Operation *parentOp = blockArg.getOwner()->getParentOp();
-      if (isa<func::FuncOp>(parentOp)) {
-        return true;
-      } else {
-        LOG_DEBUG(
-            "Subview source block argument is not from func entry block.");
-        return false;
-      }
-    }
-    // From other view-like op
-    if (auto viewLike = dyn_cast<ViewLikeOpInterface>(source.getDefiningOp())) {
-      if (viewLike->getBlock() == block) {
-        matchedOps.insert(viewLike.getOperation());
-      }
-      source = viewLike.getViewSource();
-      continue;
-    }
-    LOG_DEBUG(
-        "Subview source defining op is not ViewLikeOpInterface: " << source);
-    return false;
-  }
-  return false;
-}
-
 bool FixpipeOptPass::isStoreToGM(Operation *storeOp,
                                  SetVector<Operation *> &matchedOps) {
   ViewLikeOpInterface viewOp = nullptr;
@@ -377,7 +335,7 @@ bool FixpipeOptPass::isStoreToGM(Operation *storeOp,
   }
   matchedOps.insert(storeOp);
   matchedOps.insert(viewOp);
-  if (!isSubviewFromGlobalMemory(viewOp, matchedOps)) {
+  if (!CVPipeline::isSubviewFromGlobalMemory(viewOp, matchedOps)) {
     LOG_DEBUG("Subview is not from global memory (GM), NOT match.");
     return false;
   }

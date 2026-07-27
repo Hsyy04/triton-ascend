@@ -24,9 +24,10 @@
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
-#include "triton/Analysis/Utility.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
@@ -181,7 +182,7 @@ bool willCreateCycle(llvm::ArrayRef<Operation *> opsToUnify,
 }
 
 void cloneScalarOpsForCrossBlockUses(ComputeBlockIdManager &bmOriginal,
-                                     SetVector<Operation *> &matchedOps) {
+                                      SetVector<Operation *> &matchedOps) {
   auto sorted = mlir::topologicalSort(matchedOps);
   for (Operation *op : llvm::reverse(sorted)) {
     if (op->getNumResults() == 1 &&
@@ -211,6 +212,41 @@ void cloneScalarOpsForCrossBlockUses(ComputeBlockIdManager &bmOriginal,
       }
     }
   }
+}
+
+bool isSubviewFromGlobalMemory(ViewLikeOpInterface viewOp,
+                               SetVector<Operation *> &matchedOps) {
+  // Subview ops may be nested many layers deep through reinterpretation or
+  // other subviews. like, subview (subview (reinterpret_cast (subview
+  // (reinterpret_cast (arg0))))) so we need Search and only keep same block
+  // view-like op.
+  Value source = viewOp.getViewSource();
+  auto block = viewOp->getBlock();
+  while (true) {
+    LOG_DEBUG("Check view source: " << source << "\n");
+    if (auto blockArg = dyn_cast<BlockArgument>(source)) {
+      Operation *parentOp = blockArg.getOwner()->getParentOp();
+      if (isa<func::FuncOp>(parentOp)) {
+        return true;
+      } else {
+        LOG_DEBUG(
+            "Subview source block argument is not from func entry block.");
+        return false;
+      }
+    }
+    // From other view-like op
+    if (auto viewLike = dyn_cast<ViewLikeOpInterface>(source.getDefiningOp())) {
+      if (viewLike->getBlock() == block) {
+        matchedOps.insert(viewLike.getOperation());
+      }
+      source = viewLike.getViewSource();
+      continue;
+    }
+    LOG_DEBUG(
+        "Subview source defining op is not ViewLikeOpInterface: " << source);
+    return false;
+  }
+  return false;
 }
 
 } // namespace CVPipeline
