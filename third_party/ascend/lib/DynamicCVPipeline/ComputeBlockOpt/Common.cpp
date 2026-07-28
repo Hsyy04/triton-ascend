@@ -222,8 +222,8 @@ bool isSubviewFromGlobalMemory(ViewLikeOpInterface viewOp,
   // view-like op.
   Value source = viewOp.getViewSource();
   auto block = viewOp->getBlock();
+  LOG_DEBUG("Check view source: " << source << "\n");
   while (true) {
-    LOG_DEBUG("Check view source: " << source << "\n");
     if (auto blockArg = dyn_cast<BlockArgument>(source)) {
       Operation *parentOp = blockArg.getOwner()->getParentOp();
       if (isa<func::FuncOp>(parentOp)) {

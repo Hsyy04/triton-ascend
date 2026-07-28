@@ -49,7 +49,6 @@ void ComputeBlockOptPass::runOnOperation() {
    */
   pm.addPass(createUnifyAllocBlockPass());
   pm.addPass(createUnifyStoreBlockPass());
-  pm.addPass(createMoveLoadIntoUserPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createMergeVectorIfBlockPass());
@@ -64,10 +63,11 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createSinkI1ProducersIntoUsersPass());
-  pm.addPass(createIterVarOptPass());
+  // pm.addPass(createIterVarOptPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createFixpipeOptPass());
+  pm.addPass(createMoveLoadIntoUserPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
   if (failed(runPipeline(pm, module))) {

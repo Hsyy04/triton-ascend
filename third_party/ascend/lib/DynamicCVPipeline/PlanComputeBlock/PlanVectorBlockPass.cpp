@@ -623,25 +623,15 @@ void reverseRefineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup
   // 1. Find ops in fuse group whose pre node is a non-fusable op
 	auto toProcess =
 			findOpsAdjacentFromCube(block, nowFuseGroup, visited, memGraph, bm);
-	// 2. If no cube adjacent op, extract toProcess from fuseGroup using fallback
+	// 2. If no op from cube, extract toProcess from fuseGroup using fallback
   // rules
 	if (toProcess.empty()) {
-    LOG_DEBUG("No Cube adjacent op, extracting toProcess from fuseGroup.\n");
-    toProcess = extractToProcessFromFuseGroup(block, nowFuseGroup, bm);
+    LOG_DEBUG("No op from cube, extracting toProcess from fuseGroup.\n");
+    return;
   }
-	// 3. If still empty after extraction, no op will be cut
-  if (toProcess.empty()) {
-    LOG_DEBUG("No op will be cut after extraction.\n");
-    findCandidates(indegree, candidates, visited, memGraph, bm);
-    if (candidates.empty()) {
-      // even cut ops into next search, their no choice, like this:
-      // v1->v2->yield,  after findCandidates, no more new ops, need to fuse nowFuseGroup.
-      return;
-    }
-  }
-	// 4. Collect keepOps transitively (data + memory + loop-carried deps)
+	// 3. Collect keepOps transitively (data + memory + loop-carried deps)
 	auto keepOps = collectKeepOpsFromCube(block, toProcess, nowFuseGroup, memGraph);
-	// 5. Remove non-kept ops from fuseGroup and restore BFS state
+	// 4. Remove non-kept ops from fuseGroup and restore BFS state
   evictAndRestoreState(block, keepOps, nowFuseGroup, visited, candidates,
                        indegree, memGraph);
   LOG_DEBUG("After reverse cutting, kept " << keepOps.size() << "\n");
@@ -682,7 +672,7 @@ planVectorBlockId(Block *block,
     if (queue.empty() || nextFused == nullptr) {
       LOG_DEBUG("Prepare to check this group: \n");
       for (auto op : nowFuseGroup) {
-        LOG_DEBUG("fuseing: " << *op << "\n");
+        LOG_DEBUG("prepare: " << *op << "\n");
       }
       // finish one group, assign block id and start next iteration
       // Cut error operations before assigning block id
