@@ -378,7 +378,9 @@ bool isActiveEndNode(int srcNode, int endNode,
   for (int node : dependNodes) {
     if (nodeBlockId[node] != nodeBlockId[endNode] &&
         nodeBlockId[node] != nodeBlockId[srcNode]) {
-      return false;
+        if (linkIn[node].size() != 0){
+          return false;
+        }
     }
   }
   return true;
