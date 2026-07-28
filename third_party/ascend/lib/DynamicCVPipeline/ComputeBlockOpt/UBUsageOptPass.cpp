@@ -925,11 +925,6 @@ void mlir::triton::UBUsageOptPass::runOnOperation() {
   auto &aliasAnalysis = getAnalysis<AliasAnalysis>();
   CVPipeline::MemoryDependenceGraph memDepGraph(module, aliasAnalysis);
   auto bm = CVPipeline::ComputeBlockIdManager(module);
-  bool isUBRefineOptEnabled = false;
-  auto attr = module->getAttr(CVPipeline::kEnableUbRefineOpt);
-  if (attr) {
-    isUBRefineOptEnabled = true;
-  }
 
   llvm::SmallVector<Block *> blocks;
   module.walk([&](Block *block) { blocks.push_back(block); });
@@ -938,15 +933,6 @@ void mlir::triton::UBUsageOptPass::runOnOperation() {
     if (UBUsageOptimization(block, memDepGraph, bm).failed()) {
       llvm::errs() << "UB usage optimization failed in block.\n";
     }
-    // if (isUBRefineOptEnabled) {
-    //   if (optBroadcast(block, memDepGraph, bm).failed()) {
-    //     llvm::errs() << "Broadcast check failed in block.\n";
-    //   }
-
-    //   if (optSmallBlock(block, memDepGraph, bm).failed()) {
-    //     llvm::errs() << "Small block optimization failed in block.\n";
-    //   }
-    // }
   }
 
   LOG_DEBUG("=== Pass UBUsageOpt complete ===\n");
