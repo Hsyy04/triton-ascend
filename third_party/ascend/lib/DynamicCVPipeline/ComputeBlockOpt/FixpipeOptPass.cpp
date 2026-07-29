@@ -492,7 +492,8 @@ void FixpipeOptPass::runOnOperation() {
     for (auto op : closure.scalarOps) {
       matchedOps.insert(op);
     }
-    CVPipeline::cloneScalarOpsForCrossBlockUses(bmOriginal, matchedOps);
+    CVPipeline::cloneScalarOpsForCrossBlockUses(
+        bmOriginal, matchedOps, bmOriginal.getBlockIdByOp(matchedOps[0]));
   }
 
   auto bm = CVPipeline::ComputeBlockIdManager(module);
