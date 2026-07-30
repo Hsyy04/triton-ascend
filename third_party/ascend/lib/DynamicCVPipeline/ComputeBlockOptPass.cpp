@@ -93,6 +93,9 @@ void registerComputeBlockOptPasses() {
   registerPass(createFixpipeOptPass);
   registerPass(createUnifyStoreBlockPass);
   registerPass(createMergeSmallBlockPass);
+  registerPass(createSinkI1ProducersIntoUsersPass);
+  registerPass(createBroadcastUBOptPass);
+  registerPass(createMoveLoadIntoUserPass);
 }
 
 } // namespace triton
