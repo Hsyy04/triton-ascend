@@ -95,7 +95,7 @@ void BroadcastUBOptPass::runOnOperation() {
     if (!allUsersSameBlock)
       return;
 
-    LOG_DEBUG("broadcast " << op->getName() << " all users in same block "
+    LOG_DEBUG("broadcast " << op << " \n all users in same block "
                            << firstUserBlockId << "\n");
 
     int broadcastBlockId = bm.getBlockIdByOp(op.getOperation());

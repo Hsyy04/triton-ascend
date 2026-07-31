@@ -28,6 +28,7 @@
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -52,7 +53,7 @@ static constexpr int MIN_VF_SIZE = 3;
 static int cntCalcuateOps(llvm::SmallVector<Operation *> ops) {
   int count = 0;
   for (Operation *op : ops) {
-    if(isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(op)) {
+    if(isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp>(op)) {
       continue;
     }
     bool allOperandsTensor = llvm::all_of(op->getOperands(), [](Value operand) {

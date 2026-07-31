@@ -681,6 +681,9 @@ static void processOpsInblock(Operation *parentOp, int targetId,
   if (parentBlockId == -1) {
     return;
   }
+  if(isa<linalg::LinalgDialect>(parentOp->getDialect())) {
+    return;
+  }
 
   bool allSame = true;
   parentOp->walk([&](Operation *op) {
