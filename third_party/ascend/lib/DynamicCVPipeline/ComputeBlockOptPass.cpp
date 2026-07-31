@@ -48,28 +48,27 @@ void ComputeBlockOptPass::runOnOperation() {
      location and divide the computation blocks.
    */
   pm.addPass(createUnifyAllocBlockPass());
-  pm.addPass(createUnifyStoreBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
-
+  
   pm.addPass(createMergeVectorIfBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createMergeCubeForBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
-
+  
   pm.addPass(createUBUsageOptPass());
+  pm.addPass(createBroadcastUBOptPass());
   pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createMergeSmallBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
-
+  
+  pm.addPass(createSinkI1ProducersIntoUsersPass());
   // pm.addPass(createIterVarOptPass());
   pm.addPass(createReorderOpsByBlockIdPass());
-
+  
   pm.addPass(createFixpipeOptPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
-
-  pm.addPass(createSinkI1ProducersIntoUsersPass());
-  pm.addPass(createBroadcastUBOptPass());
   pm.addPass(createMoveLoadIntoUserPass());
+  pm.addPass(createUnifyStoreBlockPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
 
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
@@ -96,8 +95,8 @@ void registerComputeBlockOptPasses() {
   registerPass(createMergeCubeForBlockPass);
   registerPass(createFixpipeOptPass);
   registerPass(createUnifyStoreBlockPass);
-  registerPass(createMergeSmallBlockPass);
   registerPass(createSinkI1ProducersIntoUsersPass);
+  registerPass(createMergeSmallBlockPass);
   registerPass(createBroadcastUBOptPass);
   registerPass(createMoveLoadIntoUserPass);
 }
