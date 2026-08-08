@@ -24,7 +24,7 @@ Ascend NPU 硬件乘法计算单元（Cube）执行 `L0A[a] * L0A[b] + L0C → L
 | 场景 | 数据流向 | 错误表现 | 方案 |
 |------|---------|---------|------|
 | **L0C→UB** | fixpipe → Vector to_tensor → Vector 后续 op | Vector 消费者读到垃圾数据 | Part A: scf.if 插在 matmul 结果和 addf 之间 |
-| **L0C→GM** | fixpipe → bufferization.materialize_in_destination | 垃圾数据写入 HBM | Part B: 双 scf.if（无 else）守卫 store |
+| **L0C→GM** | fixpipe → bufferization.materialize_in_destination | 垃圾数据写入 GM | Part A: scf.if 插在 matmul 结果和 addf 之间  |
 | **L0C→L0C** | Cube chain 直连（无 fixpipe） | 下游硬件指令选项可处理 | 无操作 |
 | **L0C→L1** | fixpipe → L1 → 下个 matmul | — | 当前方案直接拆分，预留 Part C |
 
@@ -43,10 +43,7 @@ Ascend NPU 硬件乘法计算单元（Cube）执行 `L0A[a] * L0A[b] + L0C → L
 |------|------|------|------|
 | 1 | **SplitMatmulPattern** (StandardizeOp 内) | 检测 mayNotExec + fixpipeDst；split 拆分 matmul+C；插入 counter + scf.if | **本方案核心** |
 | 2 | PlanComputeBlock | 分类 ops 为 CUBE/VECTOR，分配 block_id | OpClassifier / PlanCubeBlock 适配 |
-| 3 | InterCoreTransferAndSync / MarkMainLoop | 插入 fixpipe / copy / memory sync | 不修改，作为本方案同步插入的定位参考 |
-| 4 | **AddMNECounterSync** | 识别 `ssbuffer.mne_counter`，在main_loop外插入 PIPE_S 同步 | **本方案新增** |
-| 5 | `…` | 后续 pass（AllocMultiCache etc.） | 不修改 |
-| 6 | **AddControlFlowCondition** | 识别可能不执行的依赖关系, 并添加对应的控制条件 | **本方案新增**  |
+| 3 | InterCoreTransferAndSync / MarkMainLoop | 插入 fixpipe / copy / memory sync | 不修改 |
 
 ### 2.2 IR 变化过程（端到端）
 
@@ -89,103 +86,6 @@ SyncBlockWait(VECTOR, PIPE_S, PIPE_S)
 use(%guarded)
 ```
 
-#### Part B: L0C→GM
-
-```mlir
-// === Input ===
-%for_result = scf.for %i = %lb to %ub step %c1 iter_args(%c_arg = %c) {
-  xxx
-  %m = linalg.matmul ins(%a, %b) outs(%c_arg)
-  scf.yield %m
-}
-bufferization.materialize_in_destination %for_result in %gm_buf
-
-
-// === Output ===
-// CUBE 侧:
-%counter = memref.alloc() : memref<i32, SSBUF(11)> {ssbuffer.mne_counter}
-memref.store %c0, %counter[]
-
-%for_result = scf.for %i = %lb to %ub step %c1 iter_args(%c_arg = %c) {
-  %m = linalg.matmul ins(%a, %b) outs(%c_arg)
-  memref.store %c1, %counter[] {core_type = "CUBE"}
-  scf.yield %m
-}
-
-SyncBlockwait(CUBE, mte3, fixpipe)
-SyncBlockSet(CUBE, fixpipe, mte3)
-%cnt_cube = memref.load %counter[] {core_type = "CUBE"}
-%has_exec = arith.cmpi ne, %cnt_cube, %c0
-scf.if %has_exec {
-  bufferization.materialize_in_destination %for_result in %gm_buf
-    {core_type = "CUBE"}
-}
-
-// VECTOR 侧:
-
-for(){
-  xxx
-}
-
-SyncBlockWait(VECTOR, fixpipe, mte3)
-SyncBlockset(VECTOR, mte3, fixpipe)
-%counter = memref.alloc() : memref<i32, SSBUF(11)> {ssbuffer.mne_counter}
-%cnt_vec = memref.load %counter[] {core_type = "VECTOR"}
-%not_exec = arith.cmpi eq, %cnt_vec, %c0
-scf.if %not_exec {
-  %zero_store = linalg.fill ...
-  bufferization.materialize_in_destination %zero_store in %gm_buf
-    {core_type = "VECTOR"}
-}
-```
-
-#### in main_loop
-以存储到gm为例
-```mlir
-
-// CUBE
-%mne_code1 = 0
-%mne_code2 = 0
-main_loop{
-  %mne_cond1 = %mne_code eq 0
-  %cond = %origin_cond and %mne_cond1 and %mne_cond2
-  if (%cond){
-    %for_result = scf.for %i = %lb to %ub step %c1 iter_args(%c_arg = %c) {
-      %m = linalg.matmul ins(%a, %b) outs(%c_arg)
-      memref.store %c1, %counter[] {core_type = "CUBE"}
-      scf.yield %m
-    }
-    memref.store 1 into mne_code1
-    %cnt_cube = memref.load %counter[] {core_type = "CUBE"}
-    %has_exec = arith.cmpi ne, %cnt_cube, %c0
-    scf.if %has_exec {
-      bufferization.materialize_in_destination %for_result in %gm_buf
-        {core_type = "CUBE"}
-    }
-  }
-
-
-}
-
-//VECTOR
-main_loop{
-  ...
-  %mne_res_cond = %mne_code2 eq 1
-  %cond = %origin_cond and %mne_res_cond
-  if (%cond){
-    %cnt_cube = memref.load %counter[] {core_type = "vector"}
-    %has_exec = arith.cmpi ne, %cnt_cube, %c0
-    scf.if %has_exec {
-      bufferization.materialize_in_destination %for_result in %gm_buf
-        {core_type = "vector"}
-    }
-    memref.store 0 into mne_code2
-  }
-}
-
-```
-
-
 ## 3. 更改设计
 
 ### 3.1 SplitMatmulPattern.cpp
@@ -216,7 +116,7 @@ matchAndRewrite:
 |------------|--------------------------|-----------|
 | ✓ | **UB**（addf 强制） | Part A |
 | ✗ | UB | Part A |
-| ✗ | GM | Part B |
+| ✗ | GM | Part A |
 | ✗ | L0C | 无 |
 | ✗ | L1 | 预留 Part C |
 
@@ -252,40 +152,6 @@ Output:
   }
   %addf = arith.addf %guarded, %bias
   // use(%addf)  ← splitMatmul 的 replaceUsesWithIf 完成
-```
-
-**Part B（L0C→GM）**
-
-```mlir
-Input:
-  %for_result = scf.for ... iter_args(%c_arg = %c) {
-    %m = linalg.matmul ins(%a, %b) outs(%c_arg)
-    scf.yield %m
-  }
-  bufferization.materialize_in_destination %for_result in %gm_buf
-
-Output:
-  %counter = memref.alloc() : memref<i32, SSBUF(11)> {ssbuffer.mne_counter}
-  memref.store %c0, %counter[]
-
-  %for_result = scf.for ... iter_args(%c_arg = %c) {
-    %m = linalg.matmul ins(%a, %b) outs(%c_arg)
-    memref.store %c1, %counter[]
-    scf.yield %m
-  }
-
-  %cnt_cube = memref.load %counter[]
-  %has_exec = arith.cmpi ne, %cnt_cube, %c0
-  scf.if %has_exec {
-    bufferization.materialize_in_destination %for_result in %gm_buf
-  }
-
-  %cnt_vec = memref.load %counter[]
-  %not_exec = arith.cmpi eq, %cnt_vec, %c0
-  scf.if %not_exec {
-    %zero_store = linalg.fill ...
-    bufferization.materialize_in_destination %zero_store in %gm_buf
-  }
 ```
 
 #### 3.1.4 函数清单
@@ -426,96 +292,3 @@ static LogicalResult splitMatmul(linalg::MatmulOp matmulOp,
 确保 if-block 内的 store 和 if-block 外经由 result 连接的 store 都被正确识别为 CUBE 消费者。
 
 ---
-
-### 3.3 AddMNECounterSync (区分一下main_loop内外)
-
-**作用**：为 Part A / Part B 统一插入 PIPE_S 同步。Set 在 Cube 侧 op 前，Wait 在 Vector load 前。
-
-#### 3.3.1 执行顺序
-
-```
-AddMNECounterSyncPass::runOnOperation:
-  walk 所有 memref::AllocOp:
-    若没有 sssbuffer.mne_counter 属性 → 跳过
-    1. 找 Cube 侧 memref::StoreOp (core_type="CUBE")
-    2. 找所有 memref::LoadOp (core_type="CUBE" 或 "VECTOR")
-    3. 从 CubeStore 上溯 parent chain 找外围 scf::ForOp
-    4. 插入同步（Part A / B 统一，无需区分）:
-       SyncBlockSet(CUBE, PIPE_S, PIPE_S) — for 循环后
-       SyncBlockWait(VECTOR, PIPE_S, PIPE_S) — VECTOR load 前
-```
-
-#### 3.3.2 IR 变化
-
-```
-Input (来自 InterCoreTransferAndSync 后):
-  %counter = memref.alloc() ... {ssbuffer.mne_counter}
-  memref.store %c0, %counter[]          // Vector init
-
-  scf.for %i = %lb to %ub step %c1 {    // Cube main loop
-    %m = linalg.matmul ins(%a, %b) outs(%bias_arg)
-    memref.store %c1, %counter[] {core_type = "CUBE"}
-    scf.yield %m
-  }
-
-  %cnt = memref.load %counter[] {core_type = "VECTOR"}
-  %has_exec = arith.cmpi ne, %cnt, %c0
-  ...
-
-────────────────────────────────────────
-AddMNECounterSync 处理后:
-────────────────────────────────────────
-
-  %counter = memref.alloc() ... {ssbuffer.mne_counter}
-  memref.store %c0, %counter[]
-
-  scf.for %i = %lb to %ub step %c1 {
-    %m = linalg.matmul ...
-    memref.store %c1, %counter[] {core_type = "CUBE"}
-    scf.yield %m
-  }
-  SyncBlockSet(CUBE, PIPE_S, PIPE_S)    // ① 循环后：Cube 数据就绪
-
-  SyncBlockWait(VECTOR, PIPE_S, PIPE_S) // ② load 前：Vector 等 Cube
-  %cnt = memref.load %counter[] {core_type = "VECTOR"}
-  %has_exec = arith.cmpi ne, %cnt, %c0
-  ...
-```
-
-#### 3.3.3 详细更改
-
-```cpp
-void AddMNECounterSyncPass::runOnOperation() {
-  ModuleOp module = getOperation();
-  if (CVPipeline::hasFallbackAttr(module)) return;
-
-  auto cubeAttr = TCoreTypeAttr::get(ctx, TCoreType::CUBE);
-  auto vecAttr  = TCoreTypeAttr::get(ctx, TCoreType::VECTOR);
-  auto pipeSAttr = PipeAttr::get(ctx, PIPE::PIPE_S);
-
-  module.walk([&](memref::AllocOp allocOp) {
-    if (!allocOp->hasAttr(CVPipeline::kMNECounter)) return;
-
-    // 1. 找 Cube store 和 Vector load
-    memref::StoreOp cubeStore = findStoreOp(allocOp, "CUBE");
-    memref::LoadOp  vecLoad  = findLoadOp(allocOp, "VECTOR");
-    if (!cubeStore || !vecLoad) return;
-
-    // 2. 找外围 scf::ForOp
-    auto forOp = cubeStore->getParentOfType<scf::ForOp>();
-    if (!forOp) return;
-
-    // 3. 插入 PIPE_S 同步
-    int flagId = flagIdCounter++;
-    auto flag = Builder(ctx).getI64IntegerAttr(flagId);
-
-    // ① for 后 Set
-    builder.setInsertionPointAfter(forOp);
-    builder.create<SyncBlockSetOp>(loc, cubeAttr, pipeSAttr, pipeSAttr, flag);
-
-    // ② load 前 Wait
-    builder.setInsertionPoint(vecLoad);
-    builder.create<SyncBlockWaitOp>(loc, vecAttr, pipeSAttr, pipeSAttr, flag);
-  });
-}
-```
