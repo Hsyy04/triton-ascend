@@ -599,12 +599,12 @@ void FixpipeOptPass::runOnOperation() {
           D
       Now we want to fuse A/B/C, so clone A' for D to avoid cycle.
   */
-  auto bmOriginal = CVPipeline::ComputeBlockIdManager(module);
+  auto bm = CVPipeline::ComputeBlockIdManager(module);
   for (auto &matchedOps : allMatchedPatterns) {
-    CVPipeline::cloneScalarOpsForCrossBlockUses(bmOriginal, matchedOps, bmOriginal.getBlockIdByOp(matchedOps[0]));
+    CVPipeline::cloneScalarOpsForCrossBlockUses(
+        bm, matchedOps, bm.getBlockIdByOp(matchedOps[0]));
   }
 
-  auto bm = CVPipeline::ComputeBlockIdManager(module);
   for (auto &matchedOps : allMatchedPatterns) {
     if (!applyFixpipeOpt(matchedOps, memDepGraph, bm)) {
       for (Operation *op : matchedOps) {

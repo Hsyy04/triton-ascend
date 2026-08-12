@@ -73,7 +73,8 @@ bool willCreateCycle(llvm::ArrayRef<Operation *> opsToUnify,
  * @param matchedOps The op set of one pattern (target op first).
  */
 void cloneScalarOpsForCrossBlockUses(ComputeBlockIdManager &bmOriginal,
-                                     SetVector<Operation *> &matchedOps, int targetBlockId);
+                                     SetVector<Operation *> &matchedOps,
+                                     int targetBlockId);
 
 /**
  * @brief Check if a view-like operation originates from global memory (GM)
