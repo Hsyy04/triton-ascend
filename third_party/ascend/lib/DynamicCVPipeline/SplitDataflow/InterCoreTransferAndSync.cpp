@@ -281,14 +281,15 @@ bool InterCoreTransferAndSyncPass::isExpectedShape(
   return isEqualedShape;
 }
 
-// insert copyop before store to avoid mte3 blocking
+// insert copyop before store to avoid mte3 blocking (store and V->C use the
+// same PIPE)
 mlir::Operation *InterCoreTransferAndSyncPass::getCopyPointBeforeStore(
     Value depValue, Operation *vectorEndOp, int iniProducerBlockId) {
   Operation *curr = vectorEndOp;
   Operation *firstStoreOpAfterProducer = nullptr;
   while (curr) {
     auto blockIdOpt = CVPipeline::getOpBlockId(curr);
-    if (!blockIdOpt || *blockIdOpt != iniProducerBlockId) {
+    if (blockIdOpt != iniProducerBlockId) {
       break;
     }
     if (curr == depValue.getDefiningOp()) {
