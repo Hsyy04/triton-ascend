@@ -69,8 +69,6 @@ public:
   }
 };
 
-std::unique_ptr<OperationPass<ModuleOp>> createPatternMatchRewritePass();
-
 } // namespace mlir::triton::CVSplit
 
 #endif // TRITON_ADAPTER_DYNAMIC_CVPIPELINE_PATTERN_MATCH_REWRITES_H

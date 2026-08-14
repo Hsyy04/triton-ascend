@@ -37,6 +37,7 @@
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
 #include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
+#include "ascend/include/DynamicCVPipeline/StandardizeOp/Passes.h"
 
 static constexpr const char *DEBUG_TYPE = "AddDynamicCVPipeline";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")

@@ -27,6 +27,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include "ascend/include/DynamicCVPipeline/StandardizeOp/Passes.h"
 #include "ascend/include/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.h"
 
 #include "DynamicCVPipeline/Common/Utils.h"
@@ -77,7 +78,7 @@ void PatternMatchRewritePass::runOnOperation() {
   LOG_DEBUG("Output mlir:\n" << moduleOp);
 }
 
-namespace mlir::triton::CVSplit {
+namespace mlir::triton{
 
 std::unique_ptr<OperationPass<ModuleOp>> createPatternMatchRewritePass() {
   return std::make_unique<PatternMatchRewritePass>();
