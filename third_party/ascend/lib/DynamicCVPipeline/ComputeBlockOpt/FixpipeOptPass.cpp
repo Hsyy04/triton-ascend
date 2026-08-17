@@ -529,15 +529,16 @@ void FixpipeOptPass::getDependentDialects(DialectRegistry &registry) const {
 }
 
 void FixpipeOptPass::runOnOperation() {
+  LOG_DEBUG("== FixpipeOpt Pass Start ==\n");
   ModuleOp module = getOperation();
 
   if (CVPipeline::hasFallbackAttr(module)) {
     return;
   }
 
+  LOG_DEBUG(module);
   auto &aliasAnalysis = getAnalysis<AliasAnalysis>();
   CVPipeline::MemoryDependenceGraph memDepGraph(module, aliasAnalysis);
-  LOG_DEBUG("== FixpipeOpt Pass Start ==\n");
   LOG_DEBUG(module);
 
   SmallVector<SetVector<Operation *>> allMatchedPatterns;

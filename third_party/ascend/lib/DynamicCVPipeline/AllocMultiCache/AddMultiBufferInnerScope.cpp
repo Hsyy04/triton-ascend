@@ -1407,7 +1407,7 @@ static int processDepVal(Value depVal, const MainLoop &loop,
   // Read the module-level `ssbuffer.insertionOptimization` attribute inline so
   // processDepVal can be called multiple times in the same pass run and stay
   // in sync with whatever the Python caller last wrote onto the ModuleOp.
-  bool enableOpt = false;
+  bool enableOpt = true;
   if (mlir::ModuleOp mod = loop->getParentOfType<mlir::ModuleOp>())
     enableOpt = mod->hasAttr(CVPipeline::kInsertionOptimization);
 

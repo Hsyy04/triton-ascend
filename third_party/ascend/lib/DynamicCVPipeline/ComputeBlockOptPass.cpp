@@ -57,6 +57,7 @@ void ComputeBlockOptPass::runOnOperation() {
 
   pm.addPass(createUBUsageOptPass());
   pm.addPass(createBroadcastUBOptPass());
+  pm.addPass(createPosMaskPatternPass());
   pm.addPass(createMergeSameSourceAxisPass());
   pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createMergeSmallBlockPass());
@@ -69,6 +70,8 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createMoveLoadIntoUserPass());
   pm.addPass(createUnifyStoreBlockPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
+  pm.addPass(createMergeSmallBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
   if (failed(runPipeline(pm, module))) {
@@ -100,6 +103,7 @@ void registerComputeBlockOptPasses() {
   registerPass(createSinkI1ProducersIntoUsersPass);
   registerPass(createBroadcastUBOptPass);
   registerPass(createMoveLoadIntoUserPass);
+  registerPass(createPosMaskPatternPass);
   registerPass(createMergeSmallBlockPass);
 }
 
