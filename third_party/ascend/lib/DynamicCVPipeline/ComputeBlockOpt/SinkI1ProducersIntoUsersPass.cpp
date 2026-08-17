@@ -101,15 +101,8 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
   SmallVector<Operation *> producers;
   // find single-result and regionless op with i1 tensor result-type
   moduleOp.walk([&](Operation *op) {
-    if (isa<scf::SCFDialect>(op->getDialect())) {
-      LOG_DEBUG("skip scf dialect op: " << op << "\n");
-    }
-    // todo: adapt sinki1 pass with multi-result op
-    else if (op->getNumResults() > 1) {
-      LOG_DEBUG("skip multi-result op: "
-                << op << " with " << op->getNumResults() << " results\n");
-    } else if (isI1Producer(op) && isPureAndRegionless(op)) {
-      LOG_DEBUG("found i1 producer: " << op << "\n");
+    if (isI1Producer(op) && isPureAndRegionless(op)) {
+      LOG_DEBUG("found i1 producer: " << *op << "\n");
       producers.push_back(op);
     }
   });
