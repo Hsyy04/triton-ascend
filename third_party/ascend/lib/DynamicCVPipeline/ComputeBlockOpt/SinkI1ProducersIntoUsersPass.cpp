@@ -25,13 +25,18 @@
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Support/LLVM.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
 static constexpr const char *DEBUG_TYPE = "sink-i1-producers-into-users";
 #define LOG_DEBUG(...)                                                         \
@@ -64,7 +69,13 @@ public:
 
 namespace {
 
-static bool isI1Producer(Operation *op) {
+static bool isValidI1Producer(Operation *op) {
+  if (isa<scf::SCFDialect>(op->getDialect())) {
+    return false;
+  }
+  if (op->getNumResults() > 1) {
+    return false;
+  }
   for (auto result : op->getResults()) {
     if (auto tensorType = dyn_cast<mlir::TensorType>(result.getType())) {
       mlir::Type elemType = tensorType.getElementType();
@@ -101,33 +112,81 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
   SmallVector<Operation *> producers;
   // find single-result and regionless op with i1 tensor result-type
   moduleOp.walk([&](Operation *op) {
-    if (isI1Producer(op) && isPureAndRegionless(op)) {
+    if (isValidI1Producer(op) && isPureAndRegionless(op)) {
       LOG_DEBUG("found i1 producer: " << *op << "\n");
-      producers.push_back(op);
+      if (bm.getBlockIdByOp(op) != -1) {
+        producers.push_back(op);
+      }
     }
   });
 
-  for (Operation *p : producers) {
-    DenseSet<int> seenBlockIds;
+  for (Operation *p : llvm::reverse(producers)) {
+    SetVector<Operation *> consumers;
     for (OpOperand &use : p->getUses()) {
       Operation *consumer = use.getOwner();
-      if (bm.isSameBlock(p, consumer)) {
+      auto consumerInblock =
+          CVPipeline::getAncestorInBlock(consumer, p->getBlock());
+      if (!consumerInblock) {
         continue;
       }
-
-      // clone producer op to consumer block and adapt use
-      int consumerBlockId = bm.getBlockIdByOp(consumer);
-      if (!seenBlockIds.insert(consumerBlockId).second) {
-        continue;
+      consumers.insert(consumerInblock);
+    }
+    if (consumers.empty()) {
+      continue;
+    }
+    LOG_DEBUG("Producer: " << *p << "have " << consumers.size() << " consumers.\n");
+    LLVM_DEBUG(
+      for(auto c: consumers){
+        LOG_DEBUG("consumer: "<< *c << "\n");
       }
-      Operation *cloned = OpBuilder(consumer).clone(*p);
-      use.set(cloned->getResult(0));
-      bm.updateBlockId(cloned, consumerBlockId);
+    );
+    DenseSet<int> seenBlockIds;
+    DenseMap<int, Operation*> blockId2Producer;
+    auto orderedConsumuers = mlir::topologicalSort(consumers);
+    // 1. Move into first consumer blockId
+    int consumerBlockId = bm.getBlockIdByOp(orderedConsumuers[0]);
+    if (consumerBlockId == -1) {
+      // if i1 break by one control op, couldn't change. //FIXME: wait for
+      // multi-region...
+      LOG_DEBUG("First consumer's blockid is -1.\n");
+      seenBlockIds.insert(bm.getBlockIdByOp(p));
+      blockId2Producer.insert({bm.getBlockIdByOp(p), p});
+    } else if (bm.isSameBlock(p, orderedConsumuers[0])) {
+      LOG_DEBUG("producer and consumer has same blockId.\n");
+      seenBlockIds.insert(consumerBlockId);
+      blockId2Producer.insert({consumerBlockId, p});
+    } else {
+      p->moveBefore(orderedConsumuers[0]);
+      LOG_DEBUG("move producer " << *p << " to " << consumerBlockId << "\n");
+      bm.updateBlockId(p, consumerBlockId);
+      blockId2Producer.insert({consumerBlockId, p});
     }
 
-    // erase producer with no user left
-    if (p->use_empty())
-      p->erase();
+    // 2. if there are other consumer, then clone producer.
+    for (auto consumerInblock : orderedConsumuers) {
+      int consumerBlockId = bm.getBlockIdByOp(consumerInblock);
+      if (!seenBlockIds.insert(consumerBlockId).second) {
+        auto producer = blockId2Producer[consumerBlockId];
+        for (auto info : llvm::enumerate(p->getResults())) {
+          auto id = info.index();
+          info.value().replaceUsesWithIf(
+              producer->getResult(id),
+              [&](OpOperand &use) { return use.getOwner() == consumerInblock; });
+        }
+        continue;
+      }
+      // Create one producer for now blockid.
+      LOG_DEBUG("clone producer " << *p << " to " << consumerBlockId << "\n");
+      auto cloned = OpBuilder(consumerInblock).clone(*p);
+      blockId2Producer.insert({consumerBlockId, cloned});
+      bm.updateBlockId(cloned, consumerBlockId);
+      for (auto info : llvm::enumerate(p->getResults())) {
+        auto id = info.index();
+        info.value().replaceUsesWithIf(
+            cloned->getResult(id),
+            [&](OpOperand &use) { return use.getOwner() == consumerInblock; });
+      }
+    }
   }
 }
 

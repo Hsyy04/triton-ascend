@@ -203,13 +203,17 @@ private:
         if (!defOp) {
           continue;
         }
+        
         if (bm.getBlockIdByOp(defOp) == blockId) {
-          int64_t valueSize = getValueSizeInBytes(operand);
-          if (valueSize == INF) {
-            return INF;
+          if (!isa<tensor::EmptyOp>(defOp)){
+            int64_t valueSize = getValueSizeInBytes(operand);
+            if (valueSize == INF) {
+              return INF;
+            }
+            total += valueSize;
           }
-          total += valueSize;
         }
+
       }
     }
     return total;
@@ -523,6 +527,7 @@ static void collectUpstream(int smallBlockId, Block *block,
                             llvm::ArrayRef<Operation *> ops,
                             const CVPipeline::MemoryDependenceGraph &memGraph) {
   bool haveCubeLink = false;
+  llvm::SmallVector<Value> allDepValues;
   llvm::SmallDenseSet<int> upBlockIds;
   for (Operation *op : ops) {
     for (Value operand : op->getOperands()) {
@@ -543,6 +548,7 @@ static void collectUpstream(int smallBlockId, Block *block,
       int bid = bm.getBlockIdByOp(defInBlock);
       if (bid != -1 && bid != smallBlockId) {
         upBlockIds.insert(bid);
+        allDepValues.push_back(operand);
       }
     }
     if (haveCubeLink) {
@@ -552,6 +558,14 @@ static void collectUpstream(int smallBlockId, Block *block,
   if (haveCubeLink) {
     LOG_DEBUG("Block " << smallBlockId
                        << " has operand defined by CUBE, no up candidates.");
+    upBlockIds.clear();
+  }
+
+  if (llvm::all_of(allDepValues, [&](Value v){
+    return CVPipeline::isScalarLike(v);
+  })) {
+    LOG_DEBUG("Block " << smallBlockId
+                       << " only has scalar dependency.");
     upBlockIds.clear();
   }
 
@@ -578,13 +592,17 @@ collectDownstream(int smallBlockId, Block *block,
                              userInBlock == block->getTerminator())) {
           continue;
         }
-        if (bm.getBlockIdByOp(userInBlock) == -1 ||
-            CVPipeline::getOpCoreType(userInBlock) !=
-                CVPipeline::CoreType::VECTOR_ONLY) {
+        int bid = bm.getBlockIdByOp(userInBlock);
+        if (bid == smallBlockId) {
+          continue;
+        }
+
+        if (bid == -1 || CVPipeline::getOpCoreType(userInBlock) !=
+                             CVPipeline::CoreType::VECTOR_ONLY) {
+          // FIXME: wait for multi-region
           haveCubeLink = true;
           break;
         }
-        int bid = bm.getBlockIdByOp(userInBlock);
         if (bid != -1 && bid != smallBlockId) {
           downBlockIds.insert(bid);
         }
@@ -605,6 +623,8 @@ collectDownstream(int smallBlockId, Block *block,
   for (int downBlockId : downBlockIds) {
     if (!CVPipeline::willCreateCycle(ops, memGraph, downBlockId, bm)) {
       candidates.push_back(downBlockId);
+    } else {
+      LOG_DEBUG("Block " << smallBlockId << " merge to " << downBlockId << " will create cycle!\n");
     }
   }
 }
@@ -683,6 +703,9 @@ void MergeSmallBlockPass::runOnOperation() {
   DenseMap<int, int> id2order;
   module.walk([&](Block *block) {
     getBlockIdsInProgramOrder(block, bm, orderedBlockIds, id2order);
+    if (orderedBlockIds.size() < 2) {
+      return ;
+    }
 
     for (int nowBlockId : orderedBlockIds) {
       LOG_DEBUG("Processing block " << nowBlockId);

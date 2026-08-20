@@ -71,6 +71,8 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createMoveLoadIntoUserPass());
   pm.addPass(createUnifyStoreBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
+  pm.addPass(createMergeSmallBlockPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
 
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
