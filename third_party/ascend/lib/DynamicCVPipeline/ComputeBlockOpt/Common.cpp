@@ -146,6 +146,9 @@ bool collectViewOpsAndCheckGlobalMemory(Value viewValue,
   if (!viewOp) {
     return false;
   }
+  if (!viewOp->hasOneUse()) {
+    return false;
+  }
   auto block = viewOp->getBlock();
   LOG_DEBUG("Check view source: " << viewValue);
   while (true) {
@@ -161,6 +164,9 @@ bool collectViewOpsAndCheckGlobalMemory(Value viewValue,
             dyn_cast<ViewLikeOpInterface>(viewValue.getDefiningOp())) {
       if (viewLike->getBlock() == block) {
         matchedOps.insert(viewLike.getOperation());
+      }
+      if (!viewLike->hasOneUse()) {
+        return false;
       }
       viewValue = viewLike.getViewSource();
       continue;

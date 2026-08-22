@@ -1540,7 +1540,7 @@ static int processDepVal(Value depVal, const MainLoop &loop,
   return 0;
 }
 
-// If `clonedDepVals` is non-null, depVals that were actually cloned 
+// If `clonedDepVals` is non-null, depVals that were actually cloned
 static int cloneDepsToConsumers(
     const MainLoop &loop, DenseMap<Value, InnerBlockInfo> &blocks,
     DenseMap<Value, SmallVector<Value>> &depValueMap,
@@ -1620,13 +1620,11 @@ static int cloneDepsToConsumers(
 // Phase 1: clone empty+fill (and any `ins` defining ops sharing the empty's
 // parentOp) to consumer blocks; runs before dep collection because the cloned
 // fill's `ins` chain may reach a producer-side tensor that Phase 2 must see.
-static int
-cloneEmptyFillsInBlocks(const MainLoop &loop,
-                        DenseMap<Value, InnerBlockInfo> &blocks,
-                        DenseMap<Value, SmallVector<Value>> &depValueMap,
-                        DenseMap<Value, SmallVector<Operation *>> &depUserMap,
-                        OpBuilder &globalBuilder,
-                        DenseSet<Value> *clonedDepVals = nullptr) {
+static int cloneEmptyFillsInBlocks(
+    const MainLoop &loop, DenseMap<Value, InnerBlockInfo> &blocks,
+    DenseMap<Value, SmallVector<Value>> &depValueMap,
+    DenseMap<Value, SmallVector<Operation *>> &depUserMap,
+    OpBuilder &globalBuilder, DenseSet<Value> *clonedDepVals = nullptr) {
   return cloneDepsToConsumers(
       loop, blocks, depValueMap, depUserMap, globalBuilder, isEmptyFillPattern,
       [](IRMapping &mapper, OpBuilder &builder, Value depVal, int userBlockId,
@@ -1635,8 +1633,7 @@ cloneEmptyFillsInBlocks(const MainLoop &loop,
         // outs may come from either tensor::EmptyOp (the original case) or
         // bufferization.alloc_tensor (the new case). Both are "fresh tensor"
         // sources and treated identically below.
-        Operation *origAllocLike =
-            fillOp.getOutputs()[0].getDefiningOp();
+        Operation *origAllocLike = fillOp.getOutputs()[0].getDefiningOp();
 
         // Collect the `ins` operands whose defining op shares the parentOp with
         // the empty/alloc_tensor.
@@ -1688,12 +1685,13 @@ cloneAllocTensorsInBlocks(const MainLoop &loop,
 }
 
 // Process cross-block tensor dependencies for double buffering
-static int processTensorDependencies(
-    const MainLoop &loop, DenseMap<Value, InnerBlockInfo> &blocks,
-    DenseMap<Value, SmallVector<Value>> &depValueMap,
-    DenseMap<Value, SmallVector<Operation *>> &depUserMap, BufferMap &bufferMap,
-    OpBuilder &globalBuilder, int &groupId,
-    const DenseSet<Value> &clonedDepVals) {
+static int
+processTensorDependencies(const MainLoop &loop,
+                          DenseMap<Value, InnerBlockInfo> &blocks,
+                          DenseMap<Value, SmallVector<Value>> &depValueMap,
+                          DenseMap<Value, SmallVector<Operation *>> &depUserMap,
+                          BufferMap &bufferMap, OpBuilder &globalBuilder,
+                          int &groupId, const DenseSet<Value> &clonedDepVals) {
   SmallVector<Operation *> seenOps;
 
   for (auto &blockPair : blocks) {

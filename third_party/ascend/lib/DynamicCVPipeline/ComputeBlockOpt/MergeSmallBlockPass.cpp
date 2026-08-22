@@ -203,9 +203,9 @@ private:
         if (!defOp) {
           continue;
         }
-        
+
         if (bm.getBlockIdByOp(defOp) == blockId) {
-          if (!isa<tensor::EmptyOp>(defOp)){
+          if (!isa<tensor::EmptyOp>(defOp)) {
             int64_t valueSize = getValueSizeInBytes(operand);
             if (valueSize == INF) {
               return INF;
@@ -213,7 +213,6 @@ private:
             total += valueSize;
           }
         }
-
       }
     }
     return total;
@@ -561,11 +560,9 @@ static void collectUpstream(int smallBlockId, Block *block,
     upBlockIds.clear();
   }
 
-  if (llvm::all_of(allDepValues, [&](Value v){
-    return CVPipeline::isScalarLike(v);
-  })) {
-    LOG_DEBUG("Block " << smallBlockId
-                       << " only has scalar dependency.");
+  if (llvm::all_of(allDepValues,
+                   [&](Value v) { return CVPipeline::isScalarLike(v); })) {
+    LOG_DEBUG("Block " << smallBlockId << " only has scalar dependency.");
     upBlockIds.clear();
   }
 
@@ -624,7 +621,8 @@ collectDownstream(int smallBlockId, Block *block,
     if (!CVPipeline::willCreateCycle(ops, memGraph, downBlockId, bm)) {
       candidates.push_back(downBlockId);
     } else {
-      LOG_DEBUG("Block " << smallBlockId << " merge to " << downBlockId << " will create cycle!\n");
+      LOG_DEBUG("Block " << smallBlockId << " merge to " << downBlockId
+                         << " will create cycle!\n");
     }
   }
 }
@@ -704,7 +702,7 @@ void MergeSmallBlockPass::runOnOperation() {
   module.walk([&](Block *block) {
     getBlockIdsInProgramOrder(block, bm, orderedBlockIds, id2order);
     if (orderedBlockIds.size() < 2) {
-      return ;
+      return;
     }
 
     for (int nowBlockId : orderedBlockIds) {

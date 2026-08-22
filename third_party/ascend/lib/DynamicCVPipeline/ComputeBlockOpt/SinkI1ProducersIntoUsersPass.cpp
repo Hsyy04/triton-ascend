@@ -134,14 +134,12 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
     if (consumers.empty()) {
       continue;
     }
-    LOG_DEBUG("Producer: " << *p << "have " << consumers.size() << " consumers.\n");
+    LOG_DEBUG("Producer: " << *p << "have " << consumers.size()
+                           << " consumers.\n");
     LLVM_DEBUG(
-      for(auto c: consumers){
-        LOG_DEBUG("consumer: "<< *c << "\n");
-      }
-    );
+        for (auto c : consumers) { LOG_DEBUG("consumer: " << *c << "\n"); });
     DenseSet<int> seenBlockIds;
-    DenseMap<int, Operation*> blockId2Producer;
+    DenseMap<int, Operation *> blockId2Producer;
     auto orderedConsumuers = mlir::topologicalSort(consumers);
     // 1. Move into first consumer blockId
     int consumerBlockId = bm.getBlockIdByOp(orderedConsumuers[0]);
@@ -170,8 +168,9 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
         for (auto info : llvm::enumerate(p->getResults())) {
           auto id = info.index();
           info.value().replaceUsesWithIf(
-              producer->getResult(id),
-              [&](OpOperand &use) { return use.getOwner() == consumerInblock; });
+              producer->getResult(id), [&](OpOperand &use) {
+                return use.getOwner() == consumerInblock;
+              });
         }
         continue;
       }
