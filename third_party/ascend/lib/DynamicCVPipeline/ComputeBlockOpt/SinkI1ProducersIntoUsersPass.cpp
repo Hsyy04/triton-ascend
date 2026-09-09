@@ -156,6 +156,7 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
     } else {
       p->moveBefore(orderedConsumuers[0]);
       LOG_DEBUG("move producer " << *p << " to " << consumerBlockId << "\n");
+      assert(false && " find i1 dependency in first user.");
       bm.updateBlockId(p, consumerBlockId);
       blockId2Producer.insert({consumerBlockId, p});
     }
@@ -163,6 +164,9 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
     // 2. if there are other consumer, then clone producer.
     for (auto consumerInblock : orderedConsumuers) {
       int consumerBlockId = bm.getBlockIdByOp(consumerInblock);
+      if (consumerBlockId == -1) {
+        continue;
+      }
       if (!seenBlockIds.insert(consumerBlockId).second) {
         auto producer = blockId2Producer[consumerBlockId];
         for (auto info : llvm::enumerate(p->getResults())) {
@@ -176,6 +180,7 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
       }
       // Create one producer for now blockid.
       LOG_DEBUG("clone producer " << *p << " to " << consumerBlockId << "\n");
+      assert(false && " find i1 dependency in other user.");
       auto cloned = OpBuilder(consumerInblock).clone(*p);
       blockId2Producer.insert({consumerBlockId, cloned});
       bm.updateBlockId(cloned, consumerBlockId);

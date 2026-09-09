@@ -72,9 +72,7 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createMergeSmallBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
-  pm.addPass(createSinkI1ProducersIntoUsersPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
-
+  
   pm.addPass(createFixpipeOptPass());
   pm.addPass(createSplitIfByBlockIdPass());
   pm.addPass(createReorderOpsByBlockIdPass());
@@ -84,17 +82,21 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createMergeSmallBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
-
+  
   pm.addPass(createMergeComputeBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
-
+  
   pm.addPass(createMergeCubeBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createRelocateMemrefDeclPass());
-
+  
   pm.addPass(createMaterializeCubePageLoadersPass());
   pm.addPass(createReorderOpsByBlockIdPass());
+  
 
+  // I wanna collect cases that, there ara i1 dependencies after ComputeBlockOpt.  
+  pm.addPass(createSinkI1ProducersIntoUsersPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
       CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
