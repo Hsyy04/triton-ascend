@@ -169,6 +169,8 @@ private:
                                            int iniProducerBlockId);
   mlir::Operation *getFixpipePointAfterProducer(Value depValue,
                                                 int iniProducerBlockId);
+  mlir::Operation *findYieldMatmulInSplitIf(Value splittedIfResult);
+  void AnalyzeSplittedIf(DependencyInfo &dep);
   mlir::Operation *insertVectorToCubeTransfer(
       mlir::OpBuilder &builder, mlir::Value srcValue,
       mlir::Value normalizedValue, mlir::Operation *vectorEndOp,
