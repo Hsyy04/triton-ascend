@@ -1761,10 +1761,10 @@ void SplitIfByBlockIdPass::runOnOperation() {
   CVPipeline::ComputeBlockIdManager bm(module);
   auto mainRes = walkMainLoop(module, [&](Operation *op) {
     auto funcOp = op->getParentOfType<func::FuncOp>();
-    if (funcOp && llvm::is_contained(kSkippedKernels, funcOp.getSymName())) {
-      LDBG("Skip kernel: " << funcOp.getSymName());
-      return llvm::success();
-    }
+    // if (funcOp && llvm::is_contained(kSkippedKernels, funcOp.getSymName())) {
+    //   LDBG("Skip kernel: " << funcOp.getSymName());
+    //   return llvm::success();
+    // }
     LDBG("Detected main loop: " << *op);
     auto &aa = getAnalysis<AliasAnalysis>();
     CVPipeline::MemoryDependenceGraph memGraph{op, aa};

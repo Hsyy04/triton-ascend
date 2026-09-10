@@ -41,7 +41,7 @@ static const llvm::SmallVector<llvm::StringRef> kBlacklistFuncNames = {
     "kernel_sdpa_fwd",
     "kernel_sdpa_bwd_q",
     "_swa_paged_decode_kernel",
-    "_mqa_logits_kernel",
+    // "_mqa_logits_kernel",
     "parallel_path_fwd_kernel",
     "chunk_bwd_kernel_dv_local",
     "chunk_fwd_kernel_h",
