@@ -960,7 +960,7 @@ createMatmulPlaceHolderValue(OpBuilder &builder, scf::IfOp ifOp,
             loc, ValueRange(zeroOp.getResult()),
             ValueRange(emptyOp.getResult()));
         fillRes->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(blockId));
-        return fillRes->getResult(0);
+        return emptyOp->getResult(0);
       })
       .Default([](auto) { return llvm::failure(); });
 }
