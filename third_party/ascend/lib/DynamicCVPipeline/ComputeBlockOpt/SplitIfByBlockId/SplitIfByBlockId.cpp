@@ -919,10 +919,9 @@ static Value getRootTensor(Value v) {
   return v;
 }
 
-static llvm::FailureOr<Value>
-createMatmulPlaceHolderValue(OpBuilder &builder, scf::IfOp ifOp,
-                             linalg::MatmulOp matmulOp,
-                             RankedTensorType tensorType, Location loc) {
+static llvm::FailureOr<Value> createMatmulPlaceHolderValue(
+    OpBuilder &builder, scf::IfOp ifOp, linalg::MatmulOp matmulOp,
+    RankedTensorType tensorType, Location loc, int blockId) {
   auto bias = matmulOp.getDpsInitOperand(0)->get();
   auto block = ifOp->getBlock();
   return llvm::TypeSwitch<Value, llvm::FailureOr<Value>>(bias)
@@ -967,8 +966,8 @@ createPlaceholderValue(int blockId, OpBuilder &builder, Location loc, Type type,
       if (matmulOpt.has_value()) {
         auto matmulOp = llvm::dyn_cast<linalg::MatmulOp>(matmulOpt.value());
         if (matmulOp) {
-          auto resultRes = createMatmulPlaceHolderValue(builder, ifOp, matmulOp,
-                                                        tensorType, loc);
+          auto resultRes = createMatmulPlaceHolderValue(
+              builder, ifOp, matmulOp, tensorType, loc, blockId);
           if (llvm::failed(resultRes)) {
             return llvm::failure();
           }
@@ -1426,9 +1425,13 @@ static scf::YieldOp safeGetTerminator(Block *block) {
   return llvm::dyn_cast_if_present<scf::YieldOp>(block->getTerminator());
 }
 
-constexpr llvm::StringRef kSplittedIf = "ssbuffer.splitted_if";
+struct SplittedIfTagGenerator {
+  int counter = 0;
+  int next() { return counter++; }
+};
 
-static void postProcess(scf::IfOp ifOp, scf::IfOp sourceIfOp, int blockId) {
+static void postProcess(scf::IfOp ifOp, scf::IfOp sourceIfOp, int blockId,
+                        int splittedIfTag) {
   OpBuilder builder{ifOp};
 
   ifOp->setAttrs(sourceIfOp->getAttrs());
@@ -1459,19 +1462,22 @@ static void postProcess(scf::IfOp ifOp, scf::IfOp sourceIfOp, int blockId) {
     setBlockId(elseYield);
   }
 
-  ifOp->setAttr(kSplittedIf, builder.getUnitAttr());
+  ifOp->setAttr(kSplittedIf, builder.getI32IntegerAttr(splittedIfTag));
 }
 
 /// Materialize a split-if chain with per-group signatures.
 /// Non-last groups get their own result types; last group carries original
 /// results.
 static llvm::LogicalResult
-materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm) {
+materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm,
+                     SplittedIfTagGenerator &tagGen) {
   OpBuilder builder(c.ifOp);
   auto originalIf = c.ifOp;
   auto loc = originalIf.getLoc();
   Value condition = originalIf.getCondition();
   auto &ya = c.yieldAug;
+
+  int splittedIfTag = tagGen.next();
 
   LDBG("[Part3] enter materializeCandidate hasYield=" << c.hasYield);
 
@@ -1565,7 +1571,7 @@ materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm) {
       updateCrossValueReplacementGroup(output, splittedIf, thenBlock,
                                        crossValueReplacement);
     }
-    postProcess(splittedIf, originalIf, groups[gi].blockId);
+    postProcess(splittedIf, originalIf, groups[gi].blockId, splittedIfTag);
   }
 
   // Phase 2: Materialize the last group.
@@ -1650,7 +1656,7 @@ materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm) {
       builder.create<scf::YieldOp>(loc);
     }
   }
-  postProcess(lastIf, originalIf, groups[lastGi].blockId);
+  postProcess(lastIf, originalIf, groups[lastGi].blockId, splittedIfTag);
 
   originalIf->erase();
 
@@ -1718,6 +1724,7 @@ public:
 } // namespace
 
 void SplitIfByBlockIdPass::runOnOperation() {
+  SplittedIfTagGenerator tagGen;
   ModuleOp module = getOperation();
   if (hasFallbackAttr(module)) {
     return;
@@ -1745,7 +1752,7 @@ void SplitIfByBlockIdPass::runOnOperation() {
       preprocessScalarDependencies(candidate);
       LLVM_DEBUG(dumpCandidate(candidate));
       analyzeDependencies(candidate);
-      if (materializeCandidate(candidate, bm).failed()) {
+      if (materializeCandidate(candidate, bm, tagGen).failed()) {
         return WalkResult::interrupt();
       }
 
@@ -1768,7 +1775,6 @@ void SplitIfByBlockIdPass::runOnOperation() {
   module->walk([&](scf::IfOp ifOp) {
     if (ifOp->hasAttr(kSplittedIf)) {
       rearrangeIfOp(ifOp, memGraph);
-      ifOp->removeAttr(kSplittedIf);
     }
   });
 
