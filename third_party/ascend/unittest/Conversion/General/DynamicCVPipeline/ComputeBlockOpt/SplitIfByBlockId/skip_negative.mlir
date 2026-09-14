@@ -121,3 +121,26 @@ func.func @skip_cube_and_vector_group(%a: tensor<2x2xf32>, %b: tensor<2x2xf32>, 
   }
   return
 }
+
+// -----
+
+// CCV: then side has CUBE -> CUBE -> VECTOR, no trailing CUBE group.
+// Data flow is only CUBE->VECTOR (no VECTOR->CUBE), so should NOT split.
+// CHECK-LABEL: func.func @skip_ccv_no_trailing_cube
+// CHECK-COUNT-1: scf.if
+// CHECK: linalg.matmul {{.*}}ssbuffer.block_id = 95
+// CHECK: linalg.matmul {{.*}}ssbuffer.block_id = 96
+// CHECK: arith.addf {{.*}}ssbuffer.block_id = 97
+func.func @skip_ccv_no_trailing_cube(%a: tensor<2x2xf32>, %b: tensor<2x2xf32>, %c: tensor<2x2xf32>, %d: tensor<2x2xf32>, %cond: i1) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  scf.for %iv = %c0 to %c1 step %c1 {
+    %cube = arith.addf %c, %d {ssbuffer.block_id = 0 : i32, ssbuffer.core_type = "CUBE"} : tensor<2x2xf32>
+    scf.if %cond {
+      %m1 = linalg.matmul ins(%a, %b : tensor<2x2xf32>, tensor<2x2xf32>) outs(%a : tensor<2x2xf32>) {ssbuffer.block_id = 95 : i32, ssbuffer.core_type = "CUBE"} -> tensor<2x2xf32>
+      %m2 = linalg.matmul ins(%m1, %b : tensor<2x2xf32>, tensor<2x2xf32>) outs(%a : tensor<2x2xf32>) {ssbuffer.block_id = 96 : i32, ssbuffer.core_type = "CUBE"} -> tensor<2x2xf32>
+      %v = arith.addf %m1, %m2 {ssbuffer.block_id = 97 : i32, ssbuffer.core_type = "VECTOR"} : tensor<2x2xf32>
+    }
+  }
+  return
+}

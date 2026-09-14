@@ -66,8 +66,8 @@
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 
 static constexpr const char *DEBUG_TYPE = "SplitIfByBlockId";
-static constexpr llvm::StringLiteral kSkippedKernels[2] = {
-    "parallel_deltaformer_fwd_kernel", "parallel_nsa_fwd_kernel"};
+static constexpr llvm::StringLiteral kSkippedKernels[1] = {
+    "parallel_deltaformer_fwd_kernel"};
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(...)                                                              \
   LLVM_DEBUG({                                                                 \
@@ -296,33 +296,6 @@ static bool hasBidirectionalCrossCoreDeps(
   return cubeFeedsVector && vectorFeedsCube;
 }
 
-/// Merge consecutive groups with the same core_type.
-/// Takes ownership via rvalue reference (elements are moved out below).
-static SmallVector<BlockGroup>
-mergeConsecutiveSameCoreType(SmallVector<BlockGroup> &&groups) {
-  if (groups.size() < 2) {
-    return std::move(groups);
-  }
-  SmallVector<BlockGroup> merged;
-  merged.push_back(std::move(groups[0]));
-  for (size_t i = 1; i < groups.size(); ++i) {
-    auto prevType = groupIsCube(merged.back());
-    auto curType = groupIsCube(groups[i]);
-    if (prevType != CoreType::UNDETERMINED &&
-        prevType != CoreType::CUBE_AND_VECTOR &&
-        curType != CoreType::UNDETERMINED &&
-        curType != CoreType::CUBE_AND_VECTOR && prevType == curType) {
-      auto &prev = merged.back();
-      prev.ops.append(groups[i].ops.begin(), groups[i].ops.end());
-      prev.nestedIfs.append(groups[i].nestedIfs.begin(),
-                            groups[i].nestedIfs.end());
-    } else {
-      merged.push_back(std::move(groups[i]));
-    }
-  }
-  return merged;
-}
-
 static inline void dumpCandidate(CandidateIf &candidate) {
   LDBG("Processing: " << candidate.ifOp);
   LDBG("  selfBlockId=" << candidate.selfBlockId);
@@ -454,10 +427,8 @@ getCandidate(scf::IfOp ifOp,
     return cand;
   }
 
-  // Merge consecutive same-core-type groups only when splitting.
-  // Merged segments define split boundaries (3 for CVC/VCV, 5 for CVCVC).
-  cand.thenGroups = mergeConsecutiveSameCoreType(std::move(rawThenGroups));
-  cand.elseGroups = mergeConsecutiveSameCoreType(std::move(rawElseGroups));
+  cand.thenGroups = std::move(rawThenGroups);
+  cand.elseGroups = std::move(rawElseGroups);
 
   return cand;
 }
@@ -919,10 +890,9 @@ static Value getRootTensor(Value v) {
   return v;
 }
 
-static llvm::FailureOr<Value>
-createMatmulPlaceHolderValue(OpBuilder &builder, scf::IfOp ifOp,
-                             linalg::MatmulOp matmulOp,
-                             RankedTensorType tensorType, Location loc) {
+static llvm::FailureOr<Value> createMatmulPlaceHolderValue(
+    OpBuilder &builder, scf::IfOp ifOp, linalg::MatmulOp matmulOp,
+    RankedTensorType tensorType, Location loc, int blockId) {
   auto bias = matmulOp.getDpsInitOperand(0)->get();
   auto block = ifOp->getBlock();
   return llvm::TypeSwitch<Value, llvm::FailureOr<Value>>(bias)
@@ -946,6 +916,8 @@ createMatmulPlaceHolderValue(OpBuilder &builder, scf::IfOp ifOp,
 
         auto emptyOp = builder.create<tensor::EmptyOp>(
             loc, tensorType.getShape(), tensorType.getElementType());
+        emptyOp->setAttr(CVPipeline::kBlockId,
+                         builder.getI32IntegerAttr(blockId));
         return emptyOp.getResult();
       })
       .Default([](auto) { return llvm::failure(); });
@@ -967,8 +939,8 @@ createPlaceholderValue(int blockId, OpBuilder &builder, Location loc, Type type,
       if (matmulOpt.has_value()) {
         auto matmulOp = llvm::dyn_cast<linalg::MatmulOp>(matmulOpt.value());
         if (matmulOp) {
-          auto resultRes = createMatmulPlaceHolderValue(builder, ifOp, matmulOp,
-                                                        tensorType, loc);
+          auto resultRes = createMatmulPlaceHolderValue(
+              builder, ifOp, matmulOp, tensorType, loc, blockId);
           if (llvm::failed(resultRes)) {
             return llvm::failure();
           }
@@ -995,8 +967,17 @@ createPlaceholderValue(int blockId, OpBuilder &builder, Location loc, Type type,
       }
     }
     if (!usedTrace) {
-      result = builder.create<tensor::EmptyOp>(loc, tensorType.getShape(),
-                                               tensorType.getElementType());
+      auto emptyOp = builder.create<tensor::EmptyOp>(
+          loc, tensorType.getShape(), tensorType.getElementType());
+      emptyOp->setAttr(CVPipeline::kBlockId,
+                       builder.getI32IntegerAttr(blockId));
+      Value fillVal = builder.create<arith::ConstantOp>(
+          loc, tensorType.getElementType(),
+          builder.getZeroAttr(tensorType.getElementType()));
+      auto fillOp = builder.create<linalg::FillOp>(
+          loc, ValueRange{fillVal}, ValueRange{emptyOp.getResult()});
+      fillOp->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(blockId));
+      result = fillOp.getResult(0);
     }
   } else if (auto floatType = dyn_cast<FloatType>(type)) {
     result = builder.create<arith::ConstantOp>(
@@ -1181,7 +1162,10 @@ rewireAndMoveOps(BlockGroup &group,
   OpBuilder builder{allOps.front()};
   for (auto *op : allOps) {
     op->moveBefore(&targetBlock, targetBlock.end());
-    op->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(group.blockId));
+    if (!op->hasAttr(CVPipeline::kBlockId) && !isa<scf::YieldOp>(op)) {
+      op->setAttr(CVPipeline::kBlockId,
+                  builder.getI32IntegerAttr(group.blockId));
+    }
   }
 }
 
@@ -1426,12 +1410,19 @@ static scf::YieldOp safeGetTerminator(Block *block) {
   return llvm::dyn_cast_if_present<scf::YieldOp>(block->getTerminator());
 }
 
-static void postProcess(scf::IfOp ifOp, scf::IfOp sourceIfOp, int blockId) {
+struct SplittedIfTagGenerator {
+  int counter = 0;
+  int next() { return counter++; }
+};
+
+static void postProcess(scf::IfOp ifOp, scf::IfOp sourceIfOp, int blockId,
+                        int splittedIfTag) {
   OpBuilder builder{ifOp};
 
   ifOp->setAttrs(sourceIfOp->getAttrs());
 
   auto thenYield = safeGetTerminator(ifOp.thenBlock());
+  auto elseYield = safeGetTerminator(ifOp.elseBlock());
   if (thenYield && thenYield.getNumOperands() > 0) {
     std::string joinedAttr =
         llvm::join(llvm::map_range(thenYield.getOperands(),
@@ -1441,7 +1432,11 @@ static void postProcess(scf::IfOp ifOp, scf::IfOp sourceIfOp, int blockId) {
                                      return CVPipeline::coreTypeToString(ct);
                                    }),
                    ", ");
-    ifOp->setAttr(CVPipeline::kCoreType, builder.getStringAttr(joinedAttr));
+    auto coreTypeAttr = builder.getStringAttr(joinedAttr);
+    ifOp->setAttr(CVPipeline::kCoreType, coreTypeAttr);
+    thenYield->setAttr(CVPipeline::kCoreType, coreTypeAttr);
+    if (elseYield)
+      elseYield->setAttr(CVPipeline::kCoreType, coreTypeAttr);
   } else {
     ifOp->removeAttr(CVPipeline::kCoreType);
   }
@@ -1450,26 +1445,24 @@ static void postProcess(scf::IfOp ifOp, scf::IfOp sourceIfOp, int blockId) {
     op->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(blockId));
   };
   setBlockId(ifOp);
-  if (thenYield) {
-    setBlockId(thenYield);
-  }
-  if (auto elseYield = safeGetTerminator(ifOp.elseBlock())) {
-    setBlockId(elseYield);
-  }
+  // Don't set block_id on scf.yield terminators
 
-  ifOp->setAttr(CVPipeline::kSplittedIf, builder.getUnitAttr());
+  ifOp->setAttr(kSplittedIf, builder.getI32IntegerAttr(splittedIfTag));
 }
 
 /// Materialize a split-if chain with per-group signatures.
 /// Non-last groups get their own result types; last group carries original
 /// results.
 static llvm::LogicalResult
-materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm) {
+materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm,
+                     SplittedIfTagGenerator &tagGen) {
   OpBuilder builder(c.ifOp);
   auto originalIf = c.ifOp;
   auto loc = originalIf.getLoc();
   Value condition = originalIf.getCondition();
   auto &ya = c.yieldAug;
+
+  int splittedIfTag = tagGen.next();
 
   LDBG("[Part3] enter materializeCandidate hasYield=" << c.hasYield);
 
@@ -1563,7 +1556,7 @@ materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm) {
       updateCrossValueReplacementGroup(output, splittedIf, thenBlock,
                                        crossValueReplacement);
     }
-    postProcess(splittedIf, originalIf, groups[gi].blockId);
+    postProcess(splittedIf, originalIf, groups[gi].blockId, splittedIfTag);
   }
 
   // Phase 2: Materialize the last group.
@@ -1648,7 +1641,7 @@ materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm) {
       builder.create<scf::YieldOp>(loc);
     }
   }
-  postProcess(lastIf, originalIf, groups[lastGi].blockId);
+  postProcess(lastIf, originalIf, groups[lastGi].blockId, splittedIfTag);
 
   originalIf->erase();
 
@@ -1716,6 +1709,7 @@ public:
 } // namespace
 
 void SplitIfByBlockIdPass::runOnOperation() {
+  SplittedIfTagGenerator tagGen;
   ModuleOp module = getOperation();
   if (hasFallbackAttr(module)) {
     return;
@@ -1743,7 +1737,7 @@ void SplitIfByBlockIdPass::runOnOperation() {
       preprocessScalarDependencies(candidate);
       LLVM_DEBUG(dumpCandidate(candidate));
       analyzeDependencies(candidate);
-      if (materializeCandidate(candidate, bm).failed()) {
+      if (materializeCandidate(candidate, bm, tagGen).failed()) {
         return WalkResult::interrupt();
       }
 
@@ -1766,7 +1760,6 @@ void SplitIfByBlockIdPass::runOnOperation() {
   module->walk([&](scf::IfOp ifOp) {
     if (ifOp->hasAttr(CVPipeline::kSplittedIf)) {
       rearrangeIfOp(ifOp, memGraph);
-      ifOp->removeAttr(CVPipeline::kSplittedIf);
     }
   });
 
