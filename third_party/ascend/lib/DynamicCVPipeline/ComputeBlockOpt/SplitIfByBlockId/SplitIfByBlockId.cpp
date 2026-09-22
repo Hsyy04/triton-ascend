@@ -1833,6 +1833,8 @@ static void hoistAndUnifyRedirectedOutput(scf::IfOp ifOp) {
   rewriter.setInsertionPoint(ifOp);
   auto newIfOp = rewriter.create<scf::IfOp>(
       loc, newResultTypes, ifOp.getCondition(), /*withElseRegion=*/true);
+  
+  newIfOp->setAttrs(ifOp->getAttrs());
 
   if (!newIfOp.getThenRegion().empty()) {
     rewriter.eraseBlock(&newIfOp.getThenRegion().front());
@@ -1883,6 +1885,8 @@ static void hoistAndUnifyRedirectedOutput(scf::IfOp ifOp) {
 
   // 4. 替换原算子
   rewriter.replaceOp(ifOp, finalReplacements);
+
+
 }
 
 void SplitIfByBlockIdPass::runOnOperation() {
