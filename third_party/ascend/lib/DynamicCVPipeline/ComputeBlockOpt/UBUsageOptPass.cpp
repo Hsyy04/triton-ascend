@@ -152,7 +152,7 @@ int64_t UBUsageOptPass::getValueSizeInBytes(Value value) {
   return 0;
 }
 
-std::optional<Block *> getParentForBlock(Block *block) {
+static std::optional<Block *> getParentForBlock(Block *block) {
   if (!block) {
     return std::nullopt;
   }

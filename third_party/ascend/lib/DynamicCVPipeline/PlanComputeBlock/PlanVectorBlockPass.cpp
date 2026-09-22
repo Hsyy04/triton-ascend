@@ -317,6 +317,37 @@ collectAllDependenciesInFuseGroup(Operation *op,
   });
 }
 
+static std::optional<Block *> getParentForBlock(Block *block) {
+  if (!block) {
+    return std::nullopt;
+  }
+
+  // Get the parent operation of the block's region.
+  Region *parentRegion = block->getParent();
+  if (!parentRegion) {
+    return std::nullopt;
+  }
+
+  auto ifOp = dyn_cast<scf::IfOp>(parentRegion->getParentOp());
+  if (!ifOp) {
+    return std::nullopt;
+  }
+
+  // Get the parent operation of the if.
+  Operation *ifParentOp = ifOp->getParentOp();
+  if (!ifParentOp) {
+    return std::nullopt;
+  }
+
+  auto forOp = dyn_cast<scf::ForOp>(ifParentOp);
+  if (!forOp) {
+    return std::nullopt;
+  }
+
+  // Return the body block of the for operation.
+  return forOp.getBody();
+}
+
 static SmallVector<Operation *>
 extractWholeFuseGroup(Block *block,
                       const SmallVector<Operation *> &nowFuseGroup,
@@ -329,26 +360,79 @@ extractWholeFuseGroup(Block *block,
   }
 
   SetVector<Operation *> toRemove;
-  auto *terminator = block->getTerminator();
-  if (llvm::isa_and_present<scf::YieldOp>(terminator) &&
-      isa<scf::ForOp, scf::WhileOp>(block->getParentOp())) {
-    for (auto *op : nowFuseGroup) {
-      auto walkResult = op->walk(
-          [block, terminator, &bm, &nowFuseGroup](Operation *nestedOp) {
-            for (auto operand : nestedOp->getOperands()) {
-              auto *defOp = getLoopCarriedDefOp(operand, block);
-              if (defOp && bm.getBlockIdByOp(defOp) == -1 &&
-                  !llvm::is_contained(nowFuseGroup, defOp)) {
-                return WalkResult::interrupt();
+  auto forBlockOpt = getParentForBlock(block);
+  if (forBlockOpt.has_value()) {
+    auto forBlock = forBlockOpt.value();
+    auto *terminator = forBlock->getTerminator();
+    if (llvm::isa_and_present<scf::YieldOp>(terminator) &&
+        isa<scf::ForOp, scf::WhileOp>(forBlock->getParentOp())) {
+      for (auto *op : nowFuseGroup) {
+        auto walkResult = op->walk(
+            [forBlock, block, terminator, &bm, &nowFuseGroup](Operation *nestedOp) {
+              if (isa<scf::SCFDialect>(nestedOp->getDialect())){
+                return WalkResult::advance();
               }
-            }
-            return WalkResult::advance();
-          });
-      if (walkResult.wasInterrupted()) {
-        collectAllUsersInFuseGroup(op, nowFuseGroup, toRemove);
+              for (auto operand : nestedOp->getOperands()) {
+                auto *defOp = getLoopCarriedDefOp(operand, forBlock);
+                if(!defOp){
+                  continue;
+                }
+                
+                auto ifOp = dyn_cast<scf::IfOp>(defOp);
+                if(!ifOp) {
+                  continue;
+                }
+                auto argIdx = getLoopCarriedArgIndex(operand, forBlock);
+                Value yielded = terminator->getOperand(argIdx);
+
+                auto resultIt = llvm::find(ifOp->getResults(), yielded);
+                if (resultIt == ifOp->getResults().end()) {
+                  continue;
+                }
+                unsigned resultIdx = std::distance(ifOp->getResults().begin(), resultIt);
+                // Get the yield in the then block.
+                Block &thenBlock = ifOp.getThenRegion().front();
+                auto thenYield = dyn_cast<scf::YieldOp>(thenBlock.getTerminator());
+                Value thenYielded = thenYield.getOperand(resultIdx);
+                if (thenYielded.getDefiningOp()){
+                  defOp = thenYielded.getDefiningOp();
+                }
+                if (defOp && bm.getBlockIdByOp(defOp) == -1 &&
+                    !llvm::is_contained(nowFuseGroup, defOp)) {
+                  return WalkResult::interrupt();
+                }
+              }
+              return WalkResult::advance();
+            });
+
+        if (walkResult.wasInterrupted()) {
+          collectAllUsersInFuseGroup(op, nowFuseGroup, toRemove);
+        }
+      }
+    }
+  }else {
+    auto *terminator = block->getTerminator();
+    if (llvm::isa_and_present<scf::YieldOp>(terminator) &&
+        isa<scf::ForOp, scf::WhileOp>(block->getParentOp())) {
+      for (auto *op : nowFuseGroup) {
+        auto walkResult = op->walk(
+            [block, terminator, &bm, &nowFuseGroup](Operation *nestedOp) {
+              for (auto operand : nestedOp->getOperands()) {
+                auto *defOp = getLoopCarriedDefOp(operand, block);
+                if (defOp && bm.getBlockIdByOp(defOp) == -1 &&
+                    !llvm::is_contained(nowFuseGroup, defOp)) {
+                  return WalkResult::interrupt();
+                }
+              }
+              return WalkResult::advance();
+            });
+        if (walkResult.wasInterrupted()) {
+          collectAllUsersInFuseGroup(op, nowFuseGroup, toRemove);
+        }
       }
     }
   }
+
 
   for (auto op : toRemove) {
     LOG_DEBUG("Removing op when refining: " << *op << "\n");
