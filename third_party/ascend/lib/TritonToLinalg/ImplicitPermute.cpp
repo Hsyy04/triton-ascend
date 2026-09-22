@@ -114,6 +114,11 @@ LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
     return success();
   }
 
+  if (existDotFlag &&
+      oldPtr.getDefiningOp<triton::MakeTensorPtrOp>()) {
+    return success();
+  }
+
   auto newMask = tf.createNewMask(oldMask, loc, rewriter);
   auto newOther = tf.createNewOther(oldOther, loc, rewriter);
 
