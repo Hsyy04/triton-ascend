@@ -33,6 +33,7 @@
 
 #include "ascend/include/DynamicCVPipeline/StandardizeOp/HoistIfCondition.h"
 #include "DynamicCVPipeline/Common/Utils.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 using namespace mlir;
 using namespace triton;
@@ -196,16 +197,17 @@ LogicalResult transformLoop(scf::ForOp forOp, scf::IfOp ifOp) {
                                                trip);
   }
 
-  // -- allocate indices buffer: memref<?x ivType> --
-  auto indicesType = MemRefType::get({ShapedType::kDynamic}, ivType);
-  Value indices =
-      builder.create<memref::AllocOp>(loc, indicesType, ValueRange{trip});
+  // -- create indices tensor: tensor<?x ivType> --
+  auto indicesTensorType = RankedTensorType::get({ShapedType::kDynamic}, ivType);
+  Value indicesTensor = builder.create<tensor::EmptyOp>(
+      loc, indicesTensorType, ValueRange{trip});
 
   // ========================================================================
   // First pass: collect valid indices
   // ========================================================================
+  // The loop carries two iter_args: count (index) and indices tensor.
   auto firstFor = builder.create<scf::ForOp>(loc, lb, ub, step,
-                                             ValueRange{c0Index});
+                                             ValueRange{c0Index, indicesTensor});
   firstFor->setAttr(kHoistedIfCondAttr, builder.getUnitAttr());
 
   {
@@ -232,32 +234,36 @@ LogicalResult transformLoop(scf::ForOp forOp, scf::IfOp ifOp) {
 
     Value cond = firstMapping.lookupOrDefault(ifOp.getCondition());
 
-    // Create index-collection scf.if (result type: index)
+    // Create index-collection scf.if (results: index count, tensor<?xivType>)
     auto collectIf = builder.create<scf::IfOp>(
-        loc, TypeRange{builder.getIndexType()}, cond,
-        /*withElseRegion=*/true);
+        loc, TypeRange{builder.getIndexType(), indicesTensorType},
+        cond, /*withElseRegion=*/true);
 
-    // then: store IV, increment count
+    // then: insert IV into indices tensor, increment count
     {
       OpBuilder::InsertionGuard guardIf(builder);
       builder.setInsertionPointToStart(collectIf.thenBlock());
       Value countIter = firstFor.getRegionIterArgs()[0];
-      builder.create<memref::StoreOp>(loc, firstFor.getInductionVar(),
-                                      indices, ValueRange{countIter});
+      Value indicesIter = firstFor.getRegionIterArgs()[1];
+      Value inserted = builder.create<tensor::InsertOp>(
+          loc, firstFor.getInductionVar(), indicesIter, ValueRange{countIter});
       Value next = builder.create<arith::AddIOp>(loc, countIter, c1Index);
-      builder.create<scf::YieldOp>(loc, next);
+      builder.create<scf::YieldOp>(loc, ValueRange{next, inserted});
     }
-    // else: yield count unchanged
+    // else: yield count and indices unchanged
     {
       OpBuilder::InsertionGuard guardElse(builder);
       builder.setInsertionPointToStart(collectIf.elseBlock());
-      builder.create<scf::YieldOp>(loc, firstFor.getRegionIterArgs()[0]);
+      builder.create<scf::YieldOp>(loc, ValueRange{
+          firstFor.getRegionIterArgs()[0], firstFor.getRegionIterArgs()[1]});
     }
 
-    builder.create<scf::YieldOp>(loc, collectIf.getResult(0));
+    builder.create<scf::YieldOp>(loc, ValueRange{
+        collectIf.getResult(0), collectIf.getResult(1)});
   }
 
   Value countFinal = firstFor.getResult(0);
+  Value indicesTensorFinal = firstFor.getResult(1);
 
   // ========================================================================
   // Second pass: execute body for valid indices
@@ -279,13 +285,13 @@ LogicalResult transformLoop(scf::ForOp forOp, scf::IfOp ifOp) {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(secondFor.getBody());
 
-    // Cast loop IV (i32) to index for memref indexing.
+    // Cast loop IV (i32) to index for tensor indexing.
     Value loopIVAsIndex = builder.create<arith::IndexCastOp>(
         loc, builder.getIndexType(), secondFor.getInductionVar());
 
-    // Load original IV from indices buffer
-    Value loadedIV = builder.create<memref::LoadOp>(
-        loc, indices, ValueRange{loopIVAsIndex});
+    // Extract original IV from indices tensor
+    Value loadedIV = builder.create<tensor::ExtractOp>(
+        loc, indicesTensorFinal, ValueRange{loopIVAsIndex});
 
     // Mapping: original IV → loaded IV, original iter_args → new iter_args
     IRMapping secondMapping;
@@ -349,6 +355,12 @@ LogicalResult transformLoop(scf::ForOp forOp, scf::IfOp ifOp) {
 } // anonymous namespace
 
 namespace mlir::triton::CVSplit {
+
+void HoistIfConditionPass::getDependentDialects(
+    DialectRegistry &registry) const {
+  registry.insert<scf::SCFDialect, arith::ArithDialect,
+                  memref::MemRefDialect, tensor::TensorDialect>();
+}
 
 void HoistIfConditionPass::runOnOperation() {
   auto moduleOp = getOperation();

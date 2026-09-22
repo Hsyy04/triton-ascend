@@ -43,10 +43,7 @@ public:
   HoistIfConditionPass() = default;
   void runOnOperation() override;
 
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<mlir::scf::SCFDialect, mlir::arith::ArithDialect,
-                    mlir::memref::MemRefDialect>();
-  }
+  void getDependentDialects(DialectRegistry &registry) const override;
 
   [[nodiscard]] llvm::StringRef getArgument() const final {
     return "ssbuf-standardize-op-hoist-if-condition";
