@@ -197,17 +197,45 @@ LogicalResult transformLoop(scf::ForOp forOp, scf::IfOp ifOp) {
                                                trip);
   }
 
-  // -- create indices tensor: tensor<?x ivType> --
-  auto indicesTensorType = RankedTensorType::get({ShapedType::kDynamic}, ivType);
-  Value indicesTensor = builder.create<tensor::EmptyOp>(
-      loc, indicesTensorType, ValueRange{trip});
+  // Try to compute a static trip count for a static-size tensor.
+  // Carrying a 1-D tensor as an scf.for iter_arg triggers downstream
+  // getDimSize(1) assertions, so use a 2-D tensor<Nx1> shape.
+  std::optional<int64_t> staticTrip;
+  auto getConstInt = [](Value v) -> std::optional<int64_t> {
+    if (auto defOp = v.getDefiningOp<arith::ConstantOp>())
+      if (auto attr = llvm::dyn_cast<IntegerAttr>(defOp.getValue()))
+        return attr.getInt();
+    return std::nullopt;
+  };
+  auto lbC = getConstInt(lb), ubC = getConstInt(ub), stepC = getConstInt(step);
+  if (lbC && ubC && stepC && *stepC != 0) {
+    int64_t d = *ubC - *lbC;
+    int64_t t = (d + (*stepC > 0 ? *stepC - 1 : *stepC + 1)) / *stepC;
+    if (t > 0)
+      staticTrip = t;
+  }
 
-  // ========================================================================
-  // First pass: collect valid indices
-  // ========================================================================
-  // The loop carries two iter_args: count (index) and indices tensor.
-  auto firstFor = builder.create<scf::ForOp>(loc, lb, ub, step,
-                                             ValueRange{c0Index, indicesTensor});
+  // -- allocate indices buffer --
+  // Static trip count → tensor.empty + tensor.insert/extract (2-D shape).
+  // Dynamic trip count → memref.alloc + memref.store/load (fallback).
+  Value indices; // memref for dynamic case
+  Type indicesResultType;
+  Value indicesInit;
+  if (staticTrip) {
+    auto staticTensorType = RankedTensorType::get({*staticTrip, 1}, ivType);
+    indicesResultType = staticTensorType;
+    indicesInit = builder.create<tensor::EmptyOp>(loc, staticTensorType,
+                                                   ValueRange{});
+  } else {
+    auto indicesType = MemRefType::get({ShapedType::kDynamic}, ivType);
+    indices = builder.create<memref::AllocOp>(loc, indicesType,
+                                               ValueRange{trip});
+    indicesResultType = nullptr;
+    indicesInit = Value{};
+  }
+  auto firstFor = builder.create<scf::ForOp>(
+      loc, lb, ub, step,
+      staticTrip ? ValueRange{c0Index, indicesInit} : ValueRange{c0Index});
   firstFor->setAttr(kHoistedIfCondAttr, builder.getUnitAttr());
 
   {
@@ -234,36 +262,60 @@ LogicalResult transformLoop(scf::ForOp forOp, scf::IfOp ifOp) {
 
     Value cond = firstMapping.lookupOrDefault(ifOp.getCondition());
 
-    // Create index-collection scf.if (results: index count, tensor<?xivType>)
-    auto collectIf = builder.create<scf::IfOp>(
-        loc, TypeRange{builder.getIndexType(), indicesTensorType},
-        cond, /*withElseRegion=*/true);
+    if (staticTrip) {
+      // ---- Tensor path: tensor.insert into static-size tensor ----
+      auto collectIf = builder.create<scf::IfOp>(
+          loc, TypeRange{builder.getIndexType(), indicesResultType},
+          cond, /*withElseRegion=*/true);
 
-    // then: insert IV into indices tensor, increment count
-    {
-      OpBuilder::InsertionGuard guardIf(builder);
-      builder.setInsertionPointToStart(collectIf.thenBlock());
-      Value countIter = firstFor.getRegionIterArgs()[0];
-      Value indicesIter = firstFor.getRegionIterArgs()[1];
-      Value inserted = builder.create<tensor::InsertOp>(
-          loc, firstFor.getInductionVar(), indicesIter, ValueRange{countIter});
-      Value next = builder.create<arith::AddIOp>(loc, countIter, c1Index);
-      builder.create<scf::YieldOp>(loc, ValueRange{next, inserted});
-    }
-    // else: yield count and indices unchanged
-    {
-      OpBuilder::InsertionGuard guardElse(builder);
-      builder.setInsertionPointToStart(collectIf.elseBlock());
+      // then: insert IV into indices tensor, increment count
+      {
+        OpBuilder::InsertionGuard guardIf(builder);
+        builder.setInsertionPointToStart(collectIf.thenBlock());
+        Value countIter = firstFor.getRegionIterArgs()[0];
+        Value indicesIter = firstFor.getRegionIterArgs()[1];
+        Value inserted = builder.create<tensor::InsertOp>(
+            loc, firstFor.getInductionVar(), indicesIter,
+            ValueRange{countIter, c0Index});
+        Value next = builder.create<arith::AddIOp>(loc, countIter, c1Index);
+        builder.create<scf::YieldOp>(loc, ValueRange{next, inserted});
+      }
+      // else: yield count and indices unchanged
+      {
+        OpBuilder::InsertionGuard guardElse(builder);
+        builder.setInsertionPointToStart(collectIf.elseBlock());
+        builder.create<scf::YieldOp>(loc, ValueRange{
+            firstFor.getRegionIterArgs()[0], firstFor.getRegionIterArgs()[1]});
+      }
       builder.create<scf::YieldOp>(loc, ValueRange{
-          firstFor.getRegionIterArgs()[0], firstFor.getRegionIterArgs()[1]});
-    }
+          collectIf.getResult(0), collectIf.getResult(1)});
+    } else {
+      // ---- Memref path: memref.store into dynamic memref ----
+      auto collectIf = builder.create<scf::IfOp>(
+          loc, TypeRange{builder.getIndexType()}, cond,
+          /*withElseRegion=*/true);
 
-    builder.create<scf::YieldOp>(loc, ValueRange{
-        collectIf.getResult(0), collectIf.getResult(1)});
+      {
+        OpBuilder::InsertionGuard guardIf(builder);
+        builder.setInsertionPointToStart(collectIf.thenBlock());
+        Value countIter = firstFor.getRegionIterArgs()[0];
+        builder.create<memref::StoreOp>(loc, firstFor.getInductionVar(),
+                                        indices, ValueRange{countIter});
+        Value next = builder.create<arith::AddIOp>(loc, countIter, c1Index);
+        builder.create<scf::YieldOp>(loc, next);
+      }
+      {
+        OpBuilder::InsertionGuard guardElse(builder);
+        builder.setInsertionPointToStart(collectIf.elseBlock());
+        builder.create<scf::YieldOp>(loc, firstFor.getRegionIterArgs()[0]);
+      }
+      builder.create<scf::YieldOp>(loc, collectIf.getResult(0));
+    }
   }
 
   Value countFinal = firstFor.getResult(0);
-  Value indicesTensorFinal = firstFor.getResult(1);
+  Value indicesTensorFinal =
+      staticTrip ? firstFor.getResult(1) : Value{};
 
   // ========================================================================
   // Second pass: execute body for valid indices
@@ -285,13 +337,19 @@ LogicalResult transformLoop(scf::ForOp forOp, scf::IfOp ifOp) {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(secondFor.getBody());
 
-    // Cast loop IV (i32) to index for tensor indexing.
+    // Cast loop IV (i32) to index for indexing.
     Value loopIVAsIndex = builder.create<arith::IndexCastOp>(
         loc, builder.getIndexType(), secondFor.getInductionVar());
 
-    // Extract original IV from indices tensor
-    Value loadedIV = builder.create<tensor::ExtractOp>(
-        loc, indicesTensorFinal, ValueRange{loopIVAsIndex});
+    // Load original IV: tensor.extract (static) or memref.load (dynamic)
+    Value loadedIV;
+    if (staticTrip) {
+      loadedIV = builder.create<tensor::ExtractOp>(
+          loc, indicesTensorFinal, ValueRange{loopIVAsIndex, c0Index});
+    } else {
+      loadedIV = builder.create<memref::LoadOp>(
+          loc, indices, ValueRange{loopIVAsIndex});
+    }
 
     // Mapping: original IV → loaded IV, original iter_args → new iter_args
     IRMapping secondMapping;
