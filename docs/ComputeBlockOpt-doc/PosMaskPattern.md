@@ -93,10 +93,10 @@
 
 ## 存在问题
 
-1. 
-2. 
+1. 解决i1依赖问题后可移除
 
 ## 目标场景
 
-1. 
-2. 
+1. zj fa-opt/test_fa_precision.py::test_flash_attention_perf
+2. zj fa-opt/test_fa_precision.py::test_flash_attention d
+3. 影响算子 fa_fwd_kernel/fwd_kernel
