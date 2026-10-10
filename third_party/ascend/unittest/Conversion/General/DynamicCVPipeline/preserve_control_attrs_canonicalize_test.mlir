@@ -157,3 +157,123 @@ module {
     return %0#0, %0#1 : i32, i32
   }
 }
+
+// -----
+
+// CHECK-LABEL: "func.func"() <{{.*}}sym_name = "different_block_ids"
+// CHECK: "scf.if"
+// CHECK: ssbuffer.block_id = 11 : i32
+// CHECK: "scf.if"
+// CHECK: ssbuffer.block_id = 12 : i32
+// CHECK-NOT: "scf.if"
+// CHECK: "func.return"
+
+module {
+  func.func @different_block_ids(%cond: i1, %lhs: memref<1xi32>, %rhs: memref<1xi32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    scf.if %cond {
+      memref.store %c1, %lhs[%c0] : memref<1xi32>
+    } {ssbuffer.block_id = 11 : i32}
+    scf.if %cond {
+      memref.store %c2, %rhs[%c0] : memref<1xi32>
+    } {ssbuffer.block_id = 12 : i32}
+    return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: "func.func"() <{{.*}}sym_name = "missing_first_block_id"
+// CHECK: "scf.if"
+// CHECK: ssbuffer.block_id = 12 : i32
+// CHECK-NOT: "scf.if"
+// CHECK: "func.return"
+
+module {
+  func.func @missing_first_block_id(%cond: i1, %lhs: memref<1xi32>, %rhs: memref<1xi32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    scf.if %cond {
+      memref.store %c1, %lhs[%c0] : memref<1xi32>
+    }
+    scf.if %cond {
+      memref.store %c2, %rhs[%c0] : memref<1xi32>
+    } {ssbuffer.block_id = 12 : i32}
+    return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: "func.func"() <{{.*}}sym_name = "missing_second_block_id"
+// CHECK: "scf.if"
+// CHECK: ssbuffer.block_id = 11 : i32
+// CHECK-NOT: "scf.if"
+// CHECK: "func.return"
+
+module {
+  func.func @missing_second_block_id(%cond: i1, %lhs: memref<1xi32>, %rhs: memref<1xi32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    scf.if %cond {
+      memref.store %c1, %lhs[%c0] : memref<1xi32>
+    } {ssbuffer.block_id = 11 : i32}
+    scf.if %cond {
+      memref.store %c2, %rhs[%c0] : memref<1xi32>
+    }
+    return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: "func.func"() <{{.*}}sym_name = "missing_both_block_ids"
+// CHECK: "scf.if"
+// CHECK-NOT: "scf.if"
+// CHECK: "func.return"
+
+module {
+  func.func @missing_both_block_ids(%cond: i1, %lhs: memref<1xi32>, %rhs: memref<1xi32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    scf.if %cond {
+      memref.store %c1, %lhs[%c0] : memref<1xi32>
+    }
+    scf.if %cond {
+      memref.store %c2, %rhs[%c0] : memref<1xi32>
+    }
+    return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: "func.func"() <{{.*}}sym_name = "different_block_ids_opposite_conditions"
+// CHECK: "scf.if"
+// CHECK: ssbuffer.block_id = 11 : i32
+// CHECK: "scf.if"
+// CHECK: ssbuffer.block_id = 12 : i32
+// CHECK-NOT: "scf.if"
+// CHECK: "func.return"
+
+module {
+  func.func @different_block_ids_opposite_conditions(%cond: i1, %lhs: memref<1xi32>, %rhs: memref<1xi32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %true = arith.constant true
+    %not = arith.xori %cond, %true : i1
+    scf.if %cond {
+      memref.store %c1, %lhs[%c0] : memref<1xi32>
+    } {ssbuffer.block_id = 11 : i32}
+    scf.if %not {
+      memref.store %c2, %rhs[%c0] : memref<1xi32>
+    } {ssbuffer.block_id = 12 : i32}
+    return
+  }
+}

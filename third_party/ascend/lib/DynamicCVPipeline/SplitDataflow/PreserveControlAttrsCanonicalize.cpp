@@ -148,6 +148,58 @@ private:
   llvm::SetVector<Operation *> recentInserts;
 };
 
+// Delegate to the upstream pattern only when merging preserves block identity.
+class BlockIdAwareCombineIfs final : public OpRewritePattern<scf::IfOp> {
+public:
+  BlockIdAwareCombineIfs(MLIRContext *ctx,
+                        std::unique_ptr<RewritePattern> original)
+      : OpRewritePattern<scf::IfOp>(ctx, original->getBenefit()),
+        originalPattern(std::move(original)) {
+    setDebugName("BlockIdAwareCombineIfs");
+    addDebugLabels(originalPattern->getDebugLabels());
+    setHasBoundedRewriteRecursion(
+        originalPattern->hasBoundedRewriteRecursion());
+  }
+
+  LogicalResult matchAndRewrite(scf::IfOp nextIf,
+                                PatternRewriter &rewriter) const override {
+    if (Operation *prevOp = nextIf->getPrevNode()) {
+      if (auto prevIf = dyn_cast<scf::IfOp>(prevOp)) {
+        Attribute prevId = prevIf->getAttr(CVPipeline::kBlockId);
+        Attribute nextId = nextIf->getAttr(CVPipeline::kBlockId);
+        if (prevId && nextId && prevId != nextId) {
+          return rewriter.notifyMatchFailure(
+              nextIf, "adjacent ifs have different ssbuffer.block_id");
+        }
+      }
+    }
+    return originalPattern->matchAndRewrite(nextIf.getOperation(), rewriter);
+  }
+
+private:
+  std::unique_ptr<RewritePattern> originalPattern;
+};
+
+static void wrapCombineIfsPattern(MLIRContext *ctx,
+                                 RewritePatternSet &patterns) {
+  for (std::unique_ptr<RewritePattern> &pattern : patterns.getNativePatterns()) {
+    auto rootKind = pattern->getRootKind();
+    if (!rootKind ||
+        rootKind->getStringRef() != scf::IfOp::getOperationName())
+      continue;
+
+    // CombineIfs is private to SCF.cpp; its default debug name is its type name.
+    StringRef debugName = pattern->getDebugName();
+    if (debugName != "CombineIfs" &&
+        debugName != "(anonymous namespace)::CombineIfs")
+      continue;
+
+    // Replace in place to preserve the order among equal-benefit patterns.
+    pattern =
+        std::make_unique<BlockIdAwareCombineIfs>(ctx, std::move(pattern));
+  }
+}
+
 static void populateCanonicalizationPatterns(MLIRContext *ctx,
                                              RewritePatternSet &patterns) {
   for (Dialect *dialect : ctx->getLoadedDialects()) {
@@ -170,6 +222,7 @@ void mlir::triton::PreserveControlAttrsCanonicalizePass::runOnOperation() {
 
   RewritePatternSet patterns(&getContext());
   populateCanonicalizationPatterns(&getContext(), patterns);
+  wrapCombineIfsPattern(&getContext(), patterns);
 
   PreserveControlAttrsListener listener;
   GreedyRewriteConfig config;
