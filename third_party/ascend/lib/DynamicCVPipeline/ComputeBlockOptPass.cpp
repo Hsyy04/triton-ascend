@@ -48,13 +48,13 @@ void ComputeBlockOptPass::runOnOperation() {
       First, perform UnifyAllocBlock to merge load semantic operations into a
      unified block. Then, use UBUsageOpt to find the smallest UB dependency
      location and divide the computation blocks.
-   */
+   */ 
   pm.addPass(createUnifyAllocBlockPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
+  // pm.addPass(createReorderOpsByBlockIdPass());
 
-  pm.addPass(createMergeVectorIfBlockPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
+  // pm.addPass(createMergeVectorIfBlockPass());
+  // pm.addPass(createReorderOpsByBlockIdPass());
+  // pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createExpLoadPatternPass());
   pm.addPass(createUBUsageOptPass());
@@ -62,28 +62,28 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createPosMaskPatternPass());
   pm.addPass(createMergeSameSourceAxisPass());
   pm.addPass(createMergeSmallBlockPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
+  // pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createSinkI1ProducersIntoUsersPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
+  // pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createFixpipeOptPass());
   pm.addPass(createSplitIfByBlockIdPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
+  // pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createMoveLoadIntoUserPass());
   pm.addPass(createUnifyStoreBlockPass());
   pm.addPass(createExpSubfPatternPass());
   pm.addPass(createMergeSmallBlockPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
+  // pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createMergeComputeBlockPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
+  // pm.addPass(createReorderOpsByBlockIdPass());
 
   pm.addPass(createMergeCubeBlockPass());
   pm.addPass(createMergeInputInitSharedCubeBlockPass());
-  pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createRelocateMemrefDeclPass());
-
+  
+  pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createUnpackScopePass());
 
   if (failed(runPipeline(pm, module))) {
