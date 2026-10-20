@@ -1489,9 +1489,10 @@ materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm,
 
   llvm::SmallDenseMap<Value, Value> crossValueReplacement;
   Operation *lastCreatedIf = originalIf.getOperation();
-
+  
   // Phase 1: Materialize each non-last group with per-group result types.
   // Phase 2 handles the last group separately.
+  llvm::errs() << "syycheck1" << *(originalIf->getParentOp()) << "\n";
   for (unsigned gi = 0; gi < nGroups - 1; ++gi) {
     auto &output = ya.groupOutputs[gi];
     scf::IfOp splittedIf;
@@ -1521,6 +1522,8 @@ materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm,
     } else {
       LDBG("[Part3] group[" << gi << "] result-bearing if ("
                             << output.outputValues.size() << " outputs)");
+
+      llvm::errs() << "groups[gi].blockId: " << groups[gi].blockId << "\n";
 
       builder.setInsertionPointAfter(lastCreatedIf);
       splittedIf = builder.create<scf::IfOp>(loc, output.outputTypes, condition,
@@ -1556,6 +1559,7 @@ materializeCandidate(CandidateIf &c, CVPipeline::ComputeBlockIdManager &bm,
                                        crossValueReplacement);
     }
     postProcess(splittedIf, originalIf, groups[gi].blockId, splittedIfTag);
+    llvm::errs() << "syycheck2" << *(originalIf->getParentOp()) << "\n";
   }
 
   // Phase 2: Materialize the last group.
@@ -1756,11 +1760,11 @@ void SplitIfByBlockIdPass::runOnOperation() {
 
   auto &aa = getAnalysis<AliasAnalysis>();
   CVPipeline::MemoryDependenceGraph memGraph{module, aa};
-  module->walk([&](scf::IfOp ifOp) {
-    if (ifOp->hasAttr(CVPipeline::kSplittedIf)) {
-      rearrangeIfOp(ifOp, memGraph);
-    }
-  });
+  // module->walk([&](scf::IfOp ifOp) {
+  //   if (ifOp->hasAttr(CVPipeline::kSplittedIf)) {
+  //     rearrangeIfOp(ifOp, memGraph);
+  //   }
+  // });
 
   LDBG("After: \n" << module << "\n----------");
 }
