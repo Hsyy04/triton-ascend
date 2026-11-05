@@ -74,13 +74,17 @@ public:
         setFallbackAttr(module, ERRCODE_FAILED);
         return;
       }
-      for (auto *op : unpackedOps) {
-        // Nothing stamps `block_id` on the ops inside a scope body, so their
-        // attrs are either empty or exactly the scope's `block_id`. Both are a
-        // subset of the scope's attrs, hence the whole AttributeArray can be
-        // shared instead of copied per attribute. The scope is trusted to carry
-        // `block_id`; a scope without it is an upstream bug and is reported by
-        // the passes that consume `block_id` afterwards.
+      // Packed units are classified atomically. Nested ops (notably the
+      // conditional padding fill) need the same classification before CV
+      // separation, which otherwise discards their unclassified side effects.
+      SmallVector<Operation *> opsToAnnotate;
+      for (Operation *op : unpackedOps) {
+        op->walk(
+            [&](Operation *nestedOp) { opsToAnnotate.push_back(nestedOp); });
+      }
+      for (Operation *op : opsToAnnotate) {
+        // Reuse the scope's attribute list when no op-specific attrs need
+        // preserving; otherwise merge while overriding the old classification.
         auto canReuseAttrs = op->getAttrs().size() == 0;
         if (op->getAttrs().size() == 1) {
           canReuseAttrs = op->hasAttr(kBlockId);
