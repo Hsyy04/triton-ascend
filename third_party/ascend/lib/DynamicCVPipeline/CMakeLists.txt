@@ -46,6 +46,7 @@ add_triton_library(DynamicCVPipeline
   PlanComputeBlock.cpp
   ComputeBlockOptPass.cpp
   AnalyzeDataFlow.cpp
+  ProtectOutputStore.cpp
   ${PLAN_COMPUTE_BLOCK_PASS_SRC}
   ${COMMON_SRC}
   ${Compute_BLOCK_OPT_SRC_FILES}
