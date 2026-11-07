@@ -20,14 +20,17 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ASCEND_PROTECT_OUTPUT_STORE_H
-#define TRITON_ASCEND_PROTECT_OUTPUT_STORE_H
+#ifndef TRITON_ASCEND_PROTECT_TCB_REUSE_H
+#define TRITON_ASCEND_PROTECT_TCB_REUSE_H
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::triton {
-std::unique_ptr<OperationPass<ModuleOp>> createProtectOutputStorePass();
-void registerProtectOutputStorePasses();
+/// Protect TCB reuse with independent VF and store synchronization passes.
+std::unique_ptr<OperationPass<ModuleOp>> createProtectTcbReusePass();
+std::unique_ptr<OperationPass<ModuleOp>> createProtectVFtcbResusePass();
+std::unique_ptr<OperationPass<ModuleOp>> createProtectSTtcbResusePass();
+void registerProtectTcbReusePasses();
 } // namespace mlir::triton
 #endif
