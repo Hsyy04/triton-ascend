@@ -80,10 +80,12 @@ static inline void addPasses(OpPassManager &pm) {
   pm.addPass(createComputeBlockOptPass());
   pm.addPass(createSplitDataflowPass());
   pm.addPass(createAnalyzeDataFlowPass());
-  pm.addPass(createProtectOutputStorePass());
   pm.addPass(createAllocMultiCachePass());
   pm.addPass(createAddControlFlowConditionPass());
   pm.addPass(createSeparateMemoryFromComputePass());
+  // Insert protection after loop preparation so syncs stay adjacent to
+  // main loops.
+  pm.addPass(createProtectOutputStorePass());
   pm.addPass(createRemoveSsbufAttrPass());
 }
 
