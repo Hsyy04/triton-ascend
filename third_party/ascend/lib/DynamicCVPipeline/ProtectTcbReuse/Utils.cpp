@@ -26,6 +26,7 @@
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/Debug.h"
 
@@ -37,42 +38,87 @@ using namespace mlir;
 using namespace mlir::triton;
 
 namespace {
-// Match loops by corresponding loop nests, logical main-loop IDs, and a
-// common enclosing block for their scopes. This structural pairing does not
-// depend on kernel names or prove physical UB aliasing after backend
-// allocation.
 struct LoopPair {
-  scf::ForOp vector;
-  scf::ForOp cube;
+  scf::ForOp vectorLoop;
+  scf::ForOp cubeLoop;
   Operation *vectorMainLoop;
   Operation *cubeMainLoop;
 };
 
-static std::optional<hivm::TCoreType> getCore(Operation *op) {
-  auto scope = op->getParentOfType<scope::ScopeOp>();
+struct LoopCandidates {
+  SmallVector<scf::ForOp> vectorLoops;
+  SmallVector<scf::ForOp> cubeLoops;
+};
+
+// Compute subtree facts once per candidate. Candidate vectors retain discovery
+// order; membership sets are never used to decide pairing or flag order.
+struct LoopInfo {
+  scf::ForOp loop;
+  Operation *firstMainLoop;
+  llvm::SmallSet<int64_t, 4> mainLoopIds;
+  unsigned mainLoopCount = 0;
+  bool hasWhileMainLoop = false;
+  bool hasFixpipe = false;
+};
+
+static std::optional<hivm::TCoreType> getCore(Operation *mainLoop) {
+  auto scope = mainLoop->getParentOfType<scope::ScopeOp>();
   if (!scope)
     return std::nullopt;
-  auto attr = scope->getAttrOfType<hivm::TCoreTypeAttr>(CVPipeline::kTcoreType);
-  if (!attr)
+  auto coreType =
+      scope->getAttrOfType<hivm::TCoreTypeAttr>(CVPipeline::kTcoreType);
+  if (!coreType)
     return std::nullopt;
-  return attr.getTcoretype();
+  return coreType.getTcoretype();
 }
 
-// Compare logical IDs rather than traversal order. Several serial main loops
-// can share one outer-loop synchronization lifecycle.
-static llvm::SmallSet<int64_t, 4> getMainLoops(scf::ForOp loop) {
-  llvm::SmallSet<int64_t, 4> ids;
-  loop.walk([&](Operation *op) {
-    if (auto id = op->getAttrOfType<IntegerAttr>(CVPipeline::kMainLoop))
-      ids.insert(id.getInt());
+static LoopCandidates
+collectLoopCandidates(func::FuncOp function,
+                      tcbReuse::LoopPredicate matchesCandidate) {
+  LoopCandidates candidates;
+  llvm::SmallPtrSet<Operation *, 16> seenVectorLoops, seenCubeLoops;
+  function.walk([&](Operation *mainLoop) {
+    if (!CVPipeline::isMainLoopOp(mainLoop))
+      return;
+    auto core = getCore(mainLoop);
+    // Several serial main loops can lead to the same enclosing loop.
+    for (auto outerLoop = dyn_cast_or_null<scf::ForOp>(mainLoop->getParentOp());
+         outerLoop;
+         outerLoop = dyn_cast<scf::ForOp>(outerLoop->getParentOp())) {
+      if (CVPipeline::isMainLoopOp(outerLoop))
+        continue;
+      if (core == hivm::TCoreType::VECTOR &&
+          seenVectorLoops.insert(outerLoop.getOperation()).second &&
+          matchesCandidate(outerLoop))
+        candidates.vectorLoops.push_back(outerLoop);
+      if (core == hivm::TCoreType::CUBE &&
+          seenCubeLoops.insert(outerLoop.getOperation()).second)
+        candidates.cubeLoops.push_back(outerLoop);
+    }
   });
-  return ids;
+  return candidates;
 }
 
-static bool sameDomain(scf::ForOp a, scf::ForOp b) {
+static LoopInfo analyzeLoop(scf::ForOp loop) {
+  LoopInfo info{loop, tcbReuse::getFirstMainLoop(loop), {}};
+  loop.walk([&](Operation *bodyOperation) {
+    if (CVPipeline::isMainLoopOp(bodyOperation))
+      ++info.mainLoopCount;
+    if (auto mainLoopId =
+            bodyOperation->getAttrOfType<IntegerAttr>(CVPipeline::kMainLoop))
+      info.mainLoopIds.insert(mainLoopId.getInt());
+    info.hasWhileMainLoop |= isa<scf::WhileOp>(bodyOperation) &&
+                             CVPipeline::isMainLoopOp(bodyOperation);
+    info.hasFixpipe |= isa<hivm::FixpipeOp>(bodyOperation);
+  });
+  return info;
+}
+
+static bool sameDomain(scf::ForOp vectorLoop, scf::ForOp cubeLoop) {
   // Only accept shared SSA bounds; equal-looking loads need a separate proof.
-  return a.getLowerBound() == b.getLowerBound() &&
-         a.getUpperBound() == b.getUpperBound() && a.getStep() == b.getStep();
+  return vectorLoop.getLowerBound() == cubeLoop.getLowerBound() &&
+         vectorLoop.getUpperBound() == cubeLoop.getUpperBound() &&
+         vectorLoop.getStep() == cubeLoop.getStep();
 }
 
 // SeparateCVScope clones nested loop bounds, so their SSA values can differ.
@@ -109,140 +155,148 @@ static void skipProtection(ModuleOp module, StringRef protectionName,
                          << protectionName << " synchronization: " << reason);
 }
 
-} // namespace
-
-// Use a direct child so synchronization stays outside the main loop and runs
-// once per outer iteration, including when the main loop has zero iterations.
-Operation *mlir::triton::tcbReuse::getFirstMainLoop(scf::ForOp outerLoop) {
-  auto &body = *outerLoop.getBody();
-  auto firstMain = llvm::find_if(body, [](Operation &bodyOperation) {
-    return CVPipeline::isMainLoopOp(&bodyOperation);
-  });
-  return firstMain == body.end() ? nullptr : &*firstMain;
+static FailureOr<const LoopInfo *>
+findUniqueCubeLoop(const LoopInfo &vectorInfo, ArrayRef<LoopInfo> cubeLoops,
+                   const llvm::SmallPtrSetImpl<Operation *> &plannedCubeLoops) {
+  const LoopInfo *matchedCube = nullptr;
+  for (const auto &cubeInfo : cubeLoops) {
+    if (cubeInfo.mainLoopCount != 2 ||
+        vectorInfo.mainLoopIds != cubeInfo.mainLoopIds ||
+        !sameLoopNest(vectorInfo.loop, cubeInfo.loop))
+      continue;
+    if (matchedCube)
+      return failure();
+    matchedCube = &cubeInfo;
+  }
+  if (!matchedCube || plannedCubeLoops.contains(matchedCube->loop))
+    return failure();
+  return matchedCube;
 }
 
-void mlir::triton::tcbReuse::protectTcbReuse(
-    ModuleOp module, StringRef protectionName, hivm::PIPE sourcePipe,
-    llvm::function_ref<bool(scf::ForOp)> matchesCandidate) {
-  if (CVPipeline::hasFallbackAttr(module))
-    return;
-  // Validate every pair and reserve enough flags before changing IR. A
-  // later failure must not leave a partially emitted synchronization plan.
+static FailureOr<SmallVector<LoopPair>>
+collectProtectionPlans(ModuleOp module, StringRef protectionName,
+                       tcbReuse::LoopPredicate matchesCandidate) {
   SmallVector<LoopPair> plans;
-  for (auto func : module.getOps<func::FuncOp>()) {
-    SmallVector<scf::ForOp> vectors, cubes;
-    func.walk([&](Operation *mainLoop) {
-      if (!CVPipeline::isMainLoopOp(mainLoop))
-        return;
-      auto core = getCore(mainLoop);
-      // Walk outward from each main loop. Serial main loops may discover
-      // the same enclosing loop, which must receive only one lifecycle.
-      for (auto outerLoop =
-               dyn_cast_or_null<scf::ForOp>(mainLoop->getParentOp());
-           outerLoop;
-           outerLoop = dyn_cast<scf::ForOp>(outerLoop->getParentOp())) {
-        if (CVPipeline::isMainLoopOp(outerLoop))
-          continue;
-        if (core == hivm::TCoreType::VECTOR && matchesCandidate(outerLoop) &&
-            !llvm::is_contained(vectors, outerLoop))
-          vectors.push_back(outerLoop);
-        if (core == hivm::TCoreType::CUBE &&
-            !llvm::is_contained(cubes, outerLoop))
-          cubes.push_back(outerLoop);
-      }
-    });
-    for (auto vector : vectors) {
-      bool unsupported = false;
-      vector.walk([&](scf::WhileOp op) {
-        if (CVPipeline::isMainLoopOp(op))
-          unsupported = true;
-      });
-      if (unsupported) {
+  llvm::SmallPtrSet<Operation *, 16> plannedCubeLoops;
+  for (auto function : module.getOps<func::FuncOp>()) {
+    auto candidates = collectLoopCandidates(function, matchesCandidate);
+    if (candidates.vectorLoops.empty())
+      continue;
+    SmallVector<LoopInfo> cubeLoops;
+    for (auto cubeLoop : candidates.cubeLoops)
+      cubeLoops.push_back(analyzeLoop(cubeLoop));
+    for (auto vectorLoop : candidates.vectorLoops) {
+      auto vectorInfo = analyzeLoop(vectorLoop);
+      // Count actual main-loop operations, not distinct logical IDs.
+      if (vectorInfo.mainLoopCount != 2)
+        continue;
+      if (vectorInfo.hasWhileMainLoop) {
         skipProtection(module, protectionName,
                        "while main loop requires a separate pairing proof");
-        return;
+        return failure();
       }
-      auto ids = getMainLoops(vector);
-      SmallVector<scf::ForOp> matches;
-      for (auto cube : cubes) {
-        auto cubeIds = getMainLoops(cube);
-        if (ids == cubeIds && sameLoopNest(vector, cube))
-          matches.push_back(cube);
-      }
-      // Require a unique match and prohibit two Vector loops from sharing
-      // one Cube receiver, preserving one sender/receiver pair per flag.
-      if (matches.size() != 1 || llvm::any_of(plans, [&](const LoopPair &p) {
-            return p.cube == matches.front();
-          })) {
+      auto cubeMatch =
+          findUniqueCubeLoop(vectorInfo, cubeLoops, plannedCubeLoops);
+      if (failed(cubeMatch)) {
         skipProtection(module, protectionName,
-                       "cannot uniquely pair output loop");
-        return;
+                       "cannot uniquely pair enclosing loop");
+        return failure();
       }
-      // A matching Cube loop without FIX has no target write to protect.
-      bool fixpipe = false;
-      matches.front().walk([&](hivm::FixpipeOp) { fixpipe = true; });
-      if (!fixpipe)
+      const auto &cubeInfo = **cubeMatch;
+      if (!cubeInfo.hasFixpipe)
         continue;
-      auto *vectorMainLoop = getFirstMainLoop(vector);
-      auto *cubeMainLoop = getFirstMainLoop(matches.front());
-      if (!vectorMainLoop || !cubeMainLoop) {
+      if (!vectorInfo.firstMainLoop || !cubeInfo.firstMainLoop) {
         skipProtection(module, protectionName,
                        "no direct main loop synchronization anchor");
-        return;
+        return failure();
       }
-      plans.push_back({vector, matches.front(), vectorMainLoop, cubeMainLoop});
+      plans.push_back({vectorLoop, cubeInfo.loop, vectorInfo.firstMainLoop,
+                       cubeInfo.firstMainLoop});
+      plannedCubeLoops.insert(cubeInfo.loop);
     }
   }
-  if (plans.empty())
-    return;
-  // Boundary syncs have no transfer_id, so AllocMultiCache accounts for
-  // their IDs without duplicating the handshake for each buffer slot.
-  // Reserve static IDs across the module. A set/wait without a known static
-  // ID may alias any proposed flag, so reject the entire plan in that case.
-  llvm::SmallSet<int64_t, 16> used;
-  bool dynamicFlag = false;
-  module.walk([&](Operation *op) {
-    if (isa<hivm::SyncBlockSetOp, hivm::SyncBlockWaitOp>(op) &&
-        !op->getAttrOfType<IntegerAttr>("static_flag_id") &&
-        !op->getAttrOfType<IntegerAttr>("flag"))
-      dynamicFlag = true;
-    if (auto attr = op->getAttrOfType<IntegerAttr>("static_flag_id"))
-      used.insert(attr.getInt());
-    if (auto attr = op->getAttrOfType<IntegerAttr>("flag"))
-      used.insert(attr.getInt());
-    if (auto sync = dyn_cast<hivm::SyncBlockOp>(op))
-      if (auto id = sync.getFlagId())
-        used.insert(id->getInt());
+  return plans;
+}
+
+static FailureOr<SmallVector<int64_t>>
+findAvailableFlags(ModuleOp module, size_t requiredCount) {
+  llvm::SmallSet<int64_t, 16> usedFlags;
+  bool hasDynamicFlag = false;
+  module.walk([&](Operation *operation) {
+    if (isa<hivm::SyncBlockSetOp, hivm::SyncBlockWaitOp>(operation) &&
+        !operation->getAttrOfType<IntegerAttr>("static_flag_id") &&
+        !operation->getAttrOfType<IntegerAttr>("flag"))
+      hasDynamicFlag = true;
+    if (auto flagId = operation->getAttrOfType<IntegerAttr>("static_flag_id"))
+      usedFlags.insert(flagId.getInt());
+    if (auto flagId = operation->getAttrOfType<IntegerAttr>("flag"))
+      usedFlags.insert(flagId.getInt());
+    if (auto sync = dyn_cast<hivm::SyncBlockOp>(operation))
+      if (auto flagId = sync.getFlagId())
+        usedFlags.insert(flagId->getInt());
   });
-  // Fill unused IDs instead of incrementing the maximum observed ID, which
-  // may already be reserved flag 15. MAX_FLAG_ID excludes that reserved ID;
-  // each boundary lifecycle uses one flag regardless of buffer slot count.
+  if (hasDynamicFlag)
+    return failure();
+  // Preserve ascending allocation, including holes below reserved flag 15.
+  // Boundary syncs have no transfer_id and are not copied per buffer slot.
   SmallVector<int64_t> flags;
-  for (int64_t id = 0; id <= FlagIdManager::MAX_FLAG_ID; ++id)
-    if (!used.contains(id))
-      flags.push_back(id);
-  if (dynamicFlag || flags.size() < plans.size()) {
+  for (int64_t flagId = 0;
+       flagId <= FlagIdManager::MAX_FLAG_ID && flags.size() < requiredCount;
+       ++flagId)
+    if (!usedFlags.contains(flagId))
+      flags.push_back(flagId);
+  if (flags.size() != requiredCount)
+    return failure();
+  return flags;
+}
+
+static void insertSynchronization(ModuleOp module, ArrayRef<LoopPair> plans,
+                                  ArrayRef<int64_t> flags,
+                                  hivm::PIPE sourcePipe) {
+  OpBuilder builder(module.getContext());
+  auto source = hivm::PipeAttr::get(module.getContext(), sourcePipe);
+  auto destination =
+      hivm::PipeAttr::get(module.getContext(), hivm::PIPE::PIPE_FIX);
+  auto vectorCore =
+      hivm::TCoreTypeAttr::get(module.getContext(), hivm::TCoreType::VECTOR);
+  auto cubeCore =
+      hivm::TCoreTypeAttr::get(module.getContext(), hivm::TCoreType::CUBE);
+  // Serial main loops share one handshake per outer iteration.
+  for (auto [pair, flag] : llvm::zip(plans, flags)) {
+    auto flagId = builder.getI64IntegerAttr(flag);
+    builder.setInsertionPoint(pair.vectorMainLoop);
+    builder.create<hivm::SyncBlockSetOp>(pair.vectorLoop->getLoc(), vectorCore,
+                                         source, destination, flagId);
+    builder.setInsertionPoint(pair.cubeMainLoop);
+    builder.create<hivm::SyncBlockWaitOp>(pair.cubeLoop->getLoc(), cubeCore,
+                                          source, destination, flagId);
+  }
+}
+} // namespace
+
+Operation *mlir::triton::tcbReuse::getFirstMainLoop(scf::ForOp outerLoop) {
+  auto &body = *outerLoop.getBody();
+  auto firstMainLoop = llvm::find_if(body, [](Operation &bodyOperation) {
+    return CVPipeline::isMainLoopOp(&bodyOperation);
+  });
+  return firstMainLoop == body.end() ? nullptr : &*firstMainLoop;
+}
+
+void mlir::triton::tcbReuse::protectTcbReuse(ModuleOp module,
+                                             StringRef protectionName,
+                                             hivm::PIPE sourcePipe,
+                                             LoopPredicate matchesCandidate) {
+  if (CVPipeline::hasFallbackAttr(module))
+    return;
+  auto plans = collectProtectionPlans(module, protectionName, matchesCandidate);
+  if (failed(plans) || plans->empty())
+    return;
+  auto flags = findAvailableFlags(module, plans->size());
+  if (failed(flags)) {
     skipProtection(module, protectionName,
                    "no free flag for tcb reuse protection");
     return;
   }
-  OpBuilder builder(module.getContext());
-  auto src = hivm::PipeAttr::get(module.getContext(), sourcePipe);
-  auto dst = hivm::PipeAttr::get(module.getContext(), hivm::PIPE::PIPE_FIX);
-  auto vector =
-      hivm::TCoreTypeAttr::get(module.getContext(), hivm::TCoreType::VECTOR);
-  auto cube =
-      hivm::TCoreTypeAttr::get(module.getContext(), hivm::TCoreType::CUBE);
-  // Place one source-pipe -> FIX handshake immediately before the first main
-  // loop on each core. Serial main loops share it, preserving one set/wait per
-  // outer iteration without delaying the scalar preparation before it.
-  for (auto [pair, flag] : llvm::zip(plans, flags)) {
-    auto id = builder.getI64IntegerAttr(flag);
-    builder.setInsertionPoint(pair.vectorMainLoop);
-    builder.create<hivm::SyncBlockSetOp>(pair.vector.getLoc(), vector, src, dst,
-                                         id);
-    builder.setInsertionPoint(pair.cubeMainLoop);
-    builder.create<hivm::SyncBlockWaitOp>(pair.cube.getLoc(), cube, src, dst,
-                                          id);
-  }
+  // Commit only after every function and resource has been validated.
+  insertSynchronization(module, *plans, *flags, sourcePipe);
 }

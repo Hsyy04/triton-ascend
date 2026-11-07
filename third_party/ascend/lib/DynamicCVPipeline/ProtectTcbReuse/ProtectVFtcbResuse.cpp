@@ -57,11 +57,12 @@ static bool isVFOperation(Operation &computation) {
 }
 
 static bool hasVFBeforeMainLoop(scf::ForOp outerLoop) {
-  auto *firstMain = tcbReuse::getFirstMainLoop(outerLoop);
-  if (!firstMain)
+  auto *firstMainLoop = tcbReuse::getFirstMainLoop(outerLoop);
+  if (!firstMainLoop)
     return false;
   return llvm::any_of(
-      llvm::make_range(outerLoop.getBody()->begin(), firstMain->getIterator()),
+      llvm::make_range(outerLoop.getBody()->begin(),
+                       firstMainLoop->getIterator()),
       [](Operation &bodyOperation) { return isVFOperation(bodyOperation); });
 }
 

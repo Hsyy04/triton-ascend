@@ -30,14 +30,17 @@
 #include "llvm/ADT/StringRef.h"
 
 namespace mlir::triton::tcbReuse {
+using LoopPredicate = llvm::function_ref<bool(scf::ForOp)>;
+
+/// Return a direct main-loop child, keeping syncs outside its iteration body.
 Operation *getFirstMainLoop(scf::ForOp outerLoop);
 
 /// Pair enclosing loops accepted by matchesCandidate and insert a sourcePipe
 /// to FIX handshake before their first main loops. Validate all candidates and
 /// flag resources before changing IR; unsupported input only logs a skip.
+/// Preconditions: matchesCandidate is a pure query and does not modify IR.
 void protectTcbReuse(ModuleOp module, StringRef protectionName,
-                     hivm::PIPE sourcePipe,
-                     llvm::function_ref<bool(scf::ForOp)> matchesCandidate);
+                     hivm::PIPE sourcePipe, LoopPredicate matchesCandidate);
 } // namespace mlir::triton::tcbReuse
 
 #endif

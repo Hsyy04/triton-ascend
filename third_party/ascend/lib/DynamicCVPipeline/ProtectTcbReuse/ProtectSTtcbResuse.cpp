@@ -20,7 +20,6 @@
  * THE SOFTWARE.
  */
 
-#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/ProtectTcbReuse.h"
 #include "ascend/include/DynamicCVPipeline/ProtectTcbReuse/Utils.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -60,10 +59,9 @@ static bool isOutputStore(Operation *op) {
 
 /// Check only direct body operations, excluding stores inside main loops.
 /// Candidates are enclosing loops discovered from a main_loop operation.
-static bool hasOutputTail(scf::ForOp outerLoop) {
+static bool hasDirectOutputStore(scf::ForOp outerLoop) {
   return llvm::any_of(*outerLoop.getBody(), [](Operation &bodyOperation) {
-    return !CVPipeline::isMainLoopOp(&bodyOperation) &&
-           isOutputStore(&bodyOperation);
+    return isOutputStore(&bodyOperation);
   });
 }
 
@@ -80,7 +78,7 @@ public:
   }
   void runOnOperation() override {
     tcbReuse::protectTcbReuse(getOperation(), "store tcb reuse",
-                              hivm::PIPE::PIPE_MTE3, hasOutputTail);
+                              hivm::PIPE::PIPE_MTE3, hasDirectOutputStore);
   }
 };
 
