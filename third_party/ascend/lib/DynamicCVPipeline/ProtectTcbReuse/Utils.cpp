@@ -1,0 +1,248 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+#include "ascend/include/DynamicCVPipeline/ProtectTcbReuse/Utils.h"
+#include "ascend/include/DynamicCVPipeline/Common/FlagIdManager.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "protect-tcb-reuse"
+#define LOG_DEBUG(...)                                                         \
+  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << __VA_ARGS__ << "\n")
+
+using namespace mlir;
+using namespace mlir::triton;
+
+namespace {
+// Match loops by corresponding loop nests, logical main-loop IDs, and a
+// common enclosing block for their scopes. This structural pairing does not
+// depend on kernel names or prove physical UB aliasing after backend
+// allocation.
+struct LoopPair {
+  scf::ForOp vector;
+  scf::ForOp cube;
+  Operation *vectorMainLoop;
+  Operation *cubeMainLoop;
+};
+
+static std::optional<hivm::TCoreType> getCore(Operation *op) {
+  auto scope = op->getParentOfType<scope::ScopeOp>();
+  if (!scope)
+    return std::nullopt;
+  auto attr = scope->getAttrOfType<hivm::TCoreTypeAttr>(CVPipeline::kTcoreType);
+  if (!attr)
+    return std::nullopt;
+  return attr.getTcoretype();
+}
+
+// Compare logical IDs rather than traversal order. Several serial main loops
+// can share one outer-loop synchronization lifecycle.
+static llvm::SmallSet<int64_t, 4> getMainLoops(scf::ForOp loop) {
+  llvm::SmallSet<int64_t, 4> ids;
+  loop.walk([&](Operation *op) {
+    if (auto id = op->getAttrOfType<IntegerAttr>(CVPipeline::kMainLoop))
+      ids.insert(id.getInt());
+  });
+  return ids;
+}
+
+static bool sameDomain(scf::ForOp a, scf::ForOp b) {
+  // Only accept shared SSA bounds; equal-looking loads need a separate proof.
+  return a.getLowerBound() == b.getLowerBound() &&
+         a.getUpperBound() == b.getUpperBound() && a.getStep() == b.getStep();
+}
+
+// SeparateCVScope clones nested loop bounds, so their SSA values can differ.
+// Match those loops by preserved control-flow block IDs, then require matching
+// enclosing for-loops up to scopes in one block with shared outermost bounds.
+// Branch-enclosed loops are excluded because their predicates need a proof.
+static bool sameLoopNest(scf::ForOp vectorLoop, scf::ForOp cubeLoop) {
+  while (true) {
+    auto vectorParent = dyn_cast<scf::ForOp>(vectorLoop->getParentOp());
+    auto cubeParent = dyn_cast<scf::ForOp>(cubeLoop->getParentOp());
+    if (!vectorParent || !cubeParent) {
+      return !vectorParent && !cubeParent &&
+             isa<scope::ScopeOp>(vectorLoop->getParentOp()) &&
+             isa<scope::ScopeOp>(cubeLoop->getParentOp()) &&
+             vectorLoop->getParentOp()->getBlock() ==
+                 cubeLoop->getParentOp()->getBlock() &&
+             sameDomain(vectorLoop, cubeLoop);
+    }
+    auto vectorId =
+        vectorLoop->getAttrOfType<IntegerAttr>(CVPipeline::kBlockId);
+    auto cubeId = cubeLoop->getAttrOfType<IntegerAttr>(CVPipeline::kBlockId);
+    if (!sameDomain(vectorLoop, cubeLoop) && (!vectorId || vectorId != cubeId))
+      return false;
+    vectorLoop = vectorParent;
+    cubeLoop = cubeParent;
+  }
+}
+
+// This protection is optional: leave IR unchanged and let dynamic CV proceed.
+static void skipProtection(ModuleOp module, StringRef protectionName,
+                           StringRef reason) {
+  for (auto function : module.getOps<func::FuncOp>())
+    LOG_DEBUG("kernel '" << function.getSymName() << "' is not protected by "
+                         << protectionName << " synchronization: " << reason);
+}
+
+} // namespace
+
+// Use a direct child so synchronization stays outside the main loop and runs
+// once per outer iteration, including when the main loop has zero iterations.
+Operation *mlir::triton::tcbReuse::getFirstMainLoop(scf::ForOp outerLoop) {
+  auto &body = *outerLoop.getBody();
+  auto firstMain = llvm::find_if(body, [](Operation &bodyOperation) {
+    return CVPipeline::isMainLoopOp(&bodyOperation);
+  });
+  return firstMain == body.end() ? nullptr : &*firstMain;
+}
+
+void mlir::triton::tcbReuse::protectTcbReuse(
+    ModuleOp module, StringRef protectionName, hivm::PIPE sourcePipe,
+    llvm::function_ref<bool(scf::ForOp)> matchesCandidate) {
+  if (CVPipeline::hasFallbackAttr(module))
+    return;
+  // Validate every pair and reserve enough flags before changing IR. A
+  // later failure must not leave a partially emitted synchronization plan.
+  SmallVector<LoopPair> plans;
+  for (auto func : module.getOps<func::FuncOp>()) {
+    SmallVector<scf::ForOp> vectors, cubes;
+    func.walk([&](Operation *mainLoop) {
+      if (!CVPipeline::isMainLoopOp(mainLoop))
+        return;
+      auto core = getCore(mainLoop);
+      // Walk outward from each main loop. Serial main loops may discover
+      // the same enclosing loop, which must receive only one lifecycle.
+      for (auto outerLoop =
+               dyn_cast_or_null<scf::ForOp>(mainLoop->getParentOp());
+           outerLoop;
+           outerLoop = dyn_cast<scf::ForOp>(outerLoop->getParentOp())) {
+        if (CVPipeline::isMainLoopOp(outerLoop))
+          continue;
+        if (core == hivm::TCoreType::VECTOR && matchesCandidate(outerLoop) &&
+            !llvm::is_contained(vectors, outerLoop))
+          vectors.push_back(outerLoop);
+        if (core == hivm::TCoreType::CUBE &&
+            !llvm::is_contained(cubes, outerLoop))
+          cubes.push_back(outerLoop);
+      }
+    });
+    for (auto vector : vectors) {
+      bool unsupported = false;
+      vector.walk([&](scf::WhileOp op) {
+        if (CVPipeline::isMainLoopOp(op))
+          unsupported = true;
+      });
+      if (unsupported) {
+        skipProtection(module, protectionName,
+                       "while main loop requires a separate pairing proof");
+        return;
+      }
+      auto ids = getMainLoops(vector);
+      SmallVector<scf::ForOp> matches;
+      for (auto cube : cubes) {
+        auto cubeIds = getMainLoops(cube);
+        if (ids == cubeIds && sameLoopNest(vector, cube))
+          matches.push_back(cube);
+      }
+      // Require a unique match and prohibit two Vector loops from sharing
+      // one Cube receiver, preserving one sender/receiver pair per flag.
+      if (matches.size() != 1 || llvm::any_of(plans, [&](const LoopPair &p) {
+            return p.cube == matches.front();
+          })) {
+        skipProtection(module, protectionName,
+                       "cannot uniquely pair output loop");
+        return;
+      }
+      // A matching Cube loop without FIX has no target write to protect.
+      bool fixpipe = false;
+      matches.front().walk([&](hivm::FixpipeOp) { fixpipe = true; });
+      if (!fixpipe)
+        continue;
+      auto *vectorMainLoop = getFirstMainLoop(vector);
+      auto *cubeMainLoop = getFirstMainLoop(matches.front());
+      if (!vectorMainLoop || !cubeMainLoop) {
+        skipProtection(module, protectionName,
+                       "no direct main loop synchronization anchor");
+        return;
+      }
+      plans.push_back({vector, matches.front(), vectorMainLoop, cubeMainLoop});
+    }
+  }
+  if (plans.empty())
+    return;
+  // Boundary syncs have no transfer_id, so AllocMultiCache accounts for
+  // their IDs without duplicating the handshake for each buffer slot.
+  // Reserve static IDs across the module. A set/wait without a known static
+  // ID may alias any proposed flag, so reject the entire plan in that case.
+  llvm::SmallSet<int64_t, 16> used;
+  bool dynamicFlag = false;
+  module.walk([&](Operation *op) {
+    if (isa<hivm::SyncBlockSetOp, hivm::SyncBlockWaitOp>(op) &&
+        !op->getAttrOfType<IntegerAttr>("static_flag_id") &&
+        !op->getAttrOfType<IntegerAttr>("flag"))
+      dynamicFlag = true;
+    if (auto attr = op->getAttrOfType<IntegerAttr>("static_flag_id"))
+      used.insert(attr.getInt());
+    if (auto attr = op->getAttrOfType<IntegerAttr>("flag"))
+      used.insert(attr.getInt());
+    if (auto sync = dyn_cast<hivm::SyncBlockOp>(op))
+      if (auto id = sync.getFlagId())
+        used.insert(id->getInt());
+  });
+  // Fill unused IDs instead of incrementing the maximum observed ID, which
+  // may already be reserved flag 15. MAX_FLAG_ID excludes that reserved ID;
+  // each boundary lifecycle uses one flag regardless of buffer slot count.
+  SmallVector<int64_t> flags;
+  for (int64_t id = 0; id <= FlagIdManager::MAX_FLAG_ID; ++id)
+    if (!used.contains(id))
+      flags.push_back(id);
+  if (dynamicFlag || flags.size() < plans.size()) {
+    skipProtection(module, protectionName,
+                   "no free flag for tcb reuse protection");
+    return;
+  }
+  OpBuilder builder(module.getContext());
+  auto src = hivm::PipeAttr::get(module.getContext(), sourcePipe);
+  auto dst = hivm::PipeAttr::get(module.getContext(), hivm::PIPE::PIPE_FIX);
+  auto vector =
+      hivm::TCoreTypeAttr::get(module.getContext(), hivm::TCoreType::VECTOR);
+  auto cube =
+      hivm::TCoreTypeAttr::get(module.getContext(), hivm::TCoreType::CUBE);
+  // Place one source-pipe -> FIX handshake immediately before the first main
+  // loop on each core. Serial main loops share it, preserving one set/wait per
+  // outer iteration without delaying the scalar preparation before it.
+  for (auto [pair, flag] : llvm::zip(plans, flags)) {
+    auto id = builder.getI64IntegerAttr(flag);
+    builder.setInsertionPoint(pair.vectorMainLoop);
+    builder.create<hivm::SyncBlockSetOp>(pair.vector.getLoc(), vector, src, dst,
+                                         id);
+    builder.setInsertionPoint(pair.cubeMainLoop);
+    builder.create<hivm::SyncBlockWaitOp>(pair.cube.getLoc(), cube, src, dst,
+                                          id);
+  }
+}
