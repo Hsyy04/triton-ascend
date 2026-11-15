@@ -556,23 +556,33 @@ DenseMap<int, int> UBUsageOptPass::collectRecordChange(
             minUBSize = nowUBSize;
           }
         }
-
         if (bestCutPointIdx > 0) {
+          bool hasNonVectorDependency = false;
+          SmallVector<int> toChangeNodes;
           // need to change not only chain[i], and chain[i]'s dependency.
           for (int i = 0; i < bestCutPointIdx; ++i) {
-            recordChange[chain[i]] = optBlockId;
+            toChangeNodes.push_back(chain[i]);
             auto chainPreNode = i - 1 < 0 ? optNode : chain[i - 1];
             auto dependNodes =
                 findDependency(chain[i], chainPreNode, linkIn, linkStart);
+            if (llvm::any_of(dependNodes, [&](int node) {
+                  return CVPipeline::getCoreTypeOfSimpleOpOrCf(nodeId2op.at(
+                             node)) != CVPipeline::CoreType::VECTOR_ONLY;
+                })) {
+              hasNonVectorDependency = true;
+              break;
+            }
             for (auto node : dependNodes) {
-              Operation *depOp = nodeId2op.at(node);
-              if (CVPipeline::getCoreTypeOfSimpleOpOrCf(depOp) !=
-                  CVPipeline::CoreType::VECTOR_ONLY) {
-                continue;
-              }
               if (nodeBlockId[node] != optBlockId) {
-                recordChange[node] = optBlockId;
+                toChangeNodes.push_back(node);
               }
+            }
+          }
+          if (hasNonVectorDependency) {
+            continue;
+          } else {
+            for (auto node : toChangeNodes) {
+              recordChange[node] = optBlockId;
             }
           }
         }
