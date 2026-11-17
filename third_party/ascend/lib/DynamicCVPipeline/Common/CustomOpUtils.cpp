@@ -24,6 +24,8 @@
 
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Builders.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Analysis.h"
 
@@ -94,18 +96,64 @@ llvm::LogicalResult CustomOpAnalysis::collectBuffers() {
   return llvm::success();
 }
 
-/// Collect the ops that build one local buffer (`alloc -> to_tensor -> custom`,
-/// or `alloc -> custom -> to_tensor` when the custom op fills the buffer) and
-/// the layout conversion of the unit's output value.
+// Follow an unshared cast chain without moving uses from other blocks or
+// absorbing unrelated buffer users into the custom unit.
+static bufferization::ToTensorOp collectToTensorThroughViewLikeOpInterface(
+    Operation *user, Block *block, SmallVectorImpl<Operation *> &viewLikeOps) {
+  while (auto castOp = dyn_cast<ViewLikeOpInterface>(user)) {
+    if (castOp->getBlock() != block || !castOp->hasOneUse())
+      return nullptr;
+    viewLikeOps.push_back(castOp);
+    user = *castOp->getUsers().begin();
+  }
+  if (user->getBlock() != block)
+    return nullptr;
+  return dyn_cast<bufferization::ToTensorOp>(user);
+}
+
+/// Keep layout conversion on the memref side so bufferization can recover
+/// the custom buffer without crossing an unbufferizable tensor conversion.
+static void
+moveToTensorAfterConvertLayout(bufferization::ToTensorOp toTensor,
+                               hivm::ConvertLayoutOp convertLayout,
+                               SmallVectorImpl<Operation *> &relevantOps) {
+  auto memrefType = cast<MemRefType>(toTensor->getOperand(0).getType());
+  auto tensorType = cast<RankedTensorType>(convertLayout.getType());
+  auto resultType =
+      MemRefType::get(tensorType.getShape(), tensorType.getElementType(),
+                      nullptr, memrefType.getMemorySpace());
+  // Clone at the original conversion so dynamic shape operands still dominate.
+  // Preserve its layouts, output-shape operands and other attributes.
+  OpBuilder builder(convertLayout);
+  auto memrefLayout =
+      cast<hivm::ConvertLayoutOp>(builder.clone(*convertLayout));
+  memrefLayout.getSourceMutable().assign(toTensor->getOperand(0));
+  memrefLayout.getResult().setType(resultType);
+
+  // Reuse to_tensor to preserve restrict/writable and any extra annotations.
+  toTensor->setOperand(0, memrefLayout.getResult());
+  toTensor->getResult(0).setType(tensorType);
+  toTensor->moveAfter(memrefLayout);
+  convertLayout.getResult().replaceAllUsesWith(toTensor.getResult());
+  convertLayout.erase();
+
+  // packScopeOp moves operations in this order, so the memref view must precede
+  // to_tensor rather than being appended after it.
+  relevantOps.insert(relevantOps.end() - 1, memrefLayout.getOperation());
+}
+
+/// Collect a local buffer, its optional memory_space_cast chain, the custom
+/// operation and to_tensor, plus the layout conversion of the output value.
 void CustomOpAnalysis::collectRelevantOps() {
   for (auto buf : localBuffers) {
     // Value the unit produces: the custom op's result for a read-only buffer,
     // the trailing `to_tensor` result when the custom op fills the buffer.
     Value outValue;
+    SmallVector<Operation *> viewLikeOps;
     if (buf.hasOneUse()) {
-      // pattern: alloc->to_tensor->customOp
-      auto toTensorOp =
-          llvm::dyn_cast<bufferization::ToTensorOp>(*buf.getUsers().begin());
+      // pattern: alloc -> memory_space_cast* -> to_tensor -> customOp
+      auto toTensorOp = collectToTensorThroughViewLikeOpInterface(
+          *buf.getUsers().begin(), customOp->getBlock(), viewLikeOps);
       if (!toTensorOp) {
         continue;
       }
@@ -118,6 +166,7 @@ void CustomOpAnalysis::collectRelevantOps() {
         outValue = customOp->getResult(0);
       }
       relevantOps.push_back(buf.getDefiningOp());
+      relevantOps.append(viewLikeOps.begin(), viewLikeOps.end());
       relevantOps.push_back(toTensorOp);
       relevantOps.push_back(customOp);
     } else {
@@ -127,10 +176,10 @@ void CustomOpAnalysis::collectRelevantOps() {
         if (user == customOp) {
           continue;
         }
-        auto currToTensorOp = llvm::dyn_cast<bufferization::ToTensorOp>(user);
+        auto currToTensorOp = collectToTensorThroughViewLikeOpInterface(
+            user, customOp->getBlock(), viewLikeOps);
         if (!currToTensorOp || toTensorOp) {
-          // 1. not to_tensor or customOp
-          // 2. or has another to_tensor
+          // Reject unrelated users and multiple tensor consumers.
           // skip this buffer
           toTensorOp = nullptr;
           break;
@@ -143,6 +192,7 @@ void CustomOpAnalysis::collectRelevantOps() {
       outValue = toTensorOp.getResult();
       relevantOps.push_back(buf.getDefiningOp());
       relevantOps.push_back(customOp);
+      relevantOps.append(viewLikeOps.begin(), viewLikeOps.end());
       relevantOps.push_back(toTensorOp);
     }
     if (!outValue || !outValue.hasOneUse()) {
@@ -150,7 +200,13 @@ void CustomOpAnalysis::collectRelevantOps() {
     }
     if (auto convertLayout = llvm::dyn_cast<hivm::ConvertLayoutOp>(
             *outValue.getUsers().begin())) {
-      relevantOps.push_back(convertLayout);
+      // 1. Create a memref layout conversion using the to_tensor input.
+      // 2. Redirect the original conversion's users to the moved to_tensor.
+      // 3. Add the new layout conversion to relevantOps before to_tensor.
+      if (auto toTensor = outValue.getDefiningOp<bufferization::ToTensorOp>())
+        moveToTensorAfterConvertLayout(toTensor, convertLayout, relevantOps);
+      else
+        relevantOps.push_back(convertLayout);
     }
   }
 }
