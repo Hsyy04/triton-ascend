@@ -26,6 +26,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/CreateIfOps.h"
@@ -76,6 +77,14 @@ static Value findIterArgInMainLoop(Value v, mlir::Type t) {
 
     for (auto [idx, operand] : llvm::enumerate(yieldOp.getOperands())) {
       if (operand.getAsOpaquePointer() == v.getAsOpaquePointer()) {
+        // While yields index the before arguments, while the else branch
+        // can only use their forwarded values in the after block.
+        if (auto whileOp = dyn_cast<scf::WhileOp>(yieldOp->getParentOp())) {
+          auto forwarded = whileOp.getConditionOp().getArgs();
+          auto it = llvm::find(forwarded, whileOp.getBeforeArguments()[idx]);
+          if (it != forwarded.end())
+            idx = std::distance(forwarded.begin(), it);
+        }
         if (idx >= iterArgs.size()) {
           LDBG("[Error]: yield operand index "
                << idx << " out of range for iter_args size "
@@ -326,6 +335,101 @@ LogicalResult CreateIfOpsPass::createIfInMainLoop(
   return success();
 }
 
+// An accumulator with a later-stage consumer must survive iterations in
+// which its producer is idle. Add a loop-carried slot so computeYieldValues
+// can forward the previous accumulator from the producer's else branch.
+static FailureOr<Operation *>
+carryCrossBlockAccumulators(Operation *loop, ControlFlowConditionInfo *info) {
+  Block *body = MainLoop(loop).getBody();
+  auto yield = cast<scf::YieldOp>(body->getTerminator());
+  SmallVector<Value> accumulators;
+  for (Operation &op : body->without_terminator()) {
+    auto matmul = dyn_cast<linalg::MatmulOp>(&op);
+    if (!matmul || !matmul.hasPureTensorSemantics())
+      continue;
+    Value result = matmul.getResult(0);
+    auto blockId = getOpBlockId(matmul);
+    bool usedInLaterBlock = llvm::any_of(result.getUses(), [&](OpOperand &use) {
+      auto consumer = dyn_cast<linalg::MatmulOp>(use.getOwner());
+      return consumer && consumer->getBlock() == body &&
+             getOpBlockId(consumer) != blockId &&
+             &use == consumer.getDpsInitOperand(0);
+    });
+    if (usedInLaterBlock && !llvm::is_contained(yield.getOperands(), result))
+      accumulators.push_back(result);
+  }
+  if (accumulators.empty())
+    return loop;
+
+  DominanceInfo dominance;
+  SmallVector<Value> inits;
+  for (Value result : accumulators) {
+    auto matmul = result.getDefiningOp<linalg::MatmulOp>();
+    Value init = matmul.getDpsInitOperand(0)->get();
+    while (auto producer = init.getDefiningOp<linalg::MatmulOp>())
+      init = producer.getDpsInitOperand(0)->get();
+
+    if (auto arg = dyn_cast<BlockArgument>(init);
+        arg && arg.getOwner() == body) {
+      if (auto forOp = dyn_cast<scf::ForOp>(loop)) {
+        init = forOp.getInitArgs()[arg.getArgNumber() - 1];
+      } else {
+        auto whileOp = cast<scf::WhileOp>(loop);
+        init = whileOp.getConditionOp().getArgs()[arg.getArgNumber()];
+        if (auto beforeArg = dyn_cast<BlockArgument>(init);
+            beforeArg && beforeArg.getOwner() == whileOp.getBeforeBody())
+          init = whileOp.getInits()[beforeArg.getArgNumber()];
+      }
+    }
+    if (!dominance.properlyDominates(init, loop)) {
+      LDBG("cross-block accumulator has no initializer outside the main loop");
+      return failure();
+    }
+    inits.push_back(init);
+  }
+
+  yield.getResultsMutable().append(accumulators);
+  if (auto forOp = dyn_cast<scf::ForOp>(loop)) {
+    auto newFor = createNewForOpWithExtras(forOp, inits);
+    newFor.getRegion().takeBody(forOp.getRegion());
+    for (Value init : inits)
+      body->addArgument(init.getType(), init.getLoc());
+    replaceOpResultUses(loop, newFor);
+    loop->erase();
+    return newFor.getOperation();
+  }
+
+  OpBuilder builder(loop);
+  auto oldWhile = cast<scf::WhileOp>(loop);
+  SmallVector<Value> newInits(oldWhile.getInits());
+  llvm::append_range(newInits, inits);
+  SmallVector<Type> resultTypes(oldWhile.getResultTypes());
+  llvm::append_range(resultTypes, ValueRange(inits).getTypes());
+  auto newWhile =
+      builder.create<scf::WhileOp>(oldWhile.getLoc(), resultTypes, newInits);
+  newWhile->setAttrs(oldWhile->getAttrs());
+  newWhile.getBefore().takeBody(oldWhile.getBefore());
+  newWhile.getAfter().takeBody(oldWhile.getAfter());
+  SmallVector<Value> forwarded;
+  for (Value init : inits) {
+    forwarded.push_back(
+        newWhile.getBeforeBody()->addArgument(init.getType(), init.getLoc()));
+    body->addArgument(init.getType(), init.getLoc());
+  }
+  newWhile.getConditionOp().getArgsMutable().append(forwarded);
+  if (info) {
+    auto args = info->whileBlockArgMap.find(oldWhile);
+    if (args != info->whileBlockArgMap.end()) {
+      auto oldArgs = std::move(args->second);
+      info->whileBlockArgMap.erase(args);
+      info->whileBlockArgMap.try_emplace(newWhile, std::move(oldArgs));
+    }
+  }
+  replaceOpResultUses(loop, newWhile);
+  loop->erase();
+  return newWhile.getOperation();
+}
+
 void CreateIfOpsPass::runOnOperation() {
   ModuleOp module = getOperation();
 
@@ -335,16 +439,24 @@ void CreateIfOpsPass::runOnOperation() {
 
   LDBG("before createIfOps:\n" << module);
 
-  auto walkResult = module.walk([&](Operation *op) -> WalkResult {
-    if (!isMainLoopOp(op)) {
-      return WalkResult::advance();
+  SmallVector<Operation *> loopOps;
+  module.walk([&](Operation *op) {
+    if (isMainLoopOp(op))
+      loopOps.push_back(op);
+  });
+  for (Operation *loopOp : loopOps) {
+    auto carriedLoop = carryCrossBlockAccumulators(loopOp, info);
+    if (failed(carriedLoop)) {
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+      return;
     }
-
+    Operation *op = *carriedLoop;
     llvm::DenseMap<int, SmallVector<Operation *>> blockOps;
     if (failed(collectOpsByBlockId(op, blockOps))) {
       LDBG("[Error]: op with ssbuffer.main_loop is neither scf::ForOp nor "
            "scf::WhileOp, or a body op is missing ssbuffer.block_id\n");
-      return WalkResult::interrupt();
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+      return;
     }
 
     // blockCounterNums is keyed on the main-loop op (scf.for or scf.while).
@@ -358,18 +470,15 @@ void CreateIfOpsPass::runOnOperation() {
 
     if (failed(computeYieldValues(op, blockOps, thenYieldValues,
                                   elseYieldValues))) {
-      return WalkResult::interrupt();
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+      return;
     }
 
     if (failed(createIfInMainLoop(op, blockOps, thenYieldValues,
                                   elseYieldValues))) {
-      return WalkResult::interrupt();
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+      return;
     }
-    return WalkResult::advance();
-  });
-  if (walkResult.wasInterrupted()) {
-    CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
-    return;
   }
 
   LDBG("after createIfOps:\n" << module);

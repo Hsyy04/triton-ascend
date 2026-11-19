@@ -26,6 +26,7 @@
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -113,7 +114,12 @@ static LogicalResult cloneOpsForBlock(
   // Collect all ops from earlier blocks to clone
   SmallVector<Operation *> toClone;
   for (int eid : earlierIds) {
-    llvm::append_range(toClone, blockOps.lookup(eid));
+    for (Operation *op : blockOps.lookup(eid)) {
+      // Keep matmul results as cross-block dependencies.
+      if (!isa<linalg::MatmulOp>(op)) {
+        toClone.push_back(op);
+      }
+    }
   }
   if (toClone.empty()) {
     return success();

@@ -438,22 +438,11 @@ static bool checkValidInputSeed(Operation *op) {
              arith::ExtFOp>(op);
 }
 
-static bool checkValidUserSeed(Operation *op, linalg::MatmulOp &preDot) {
-  // keep unify to OpClassifer
-  if (isa<hivm::StoreOp, bufferization::MaterializeInDestinationOp,
-          ViewLikeOpInterface, tensor::ExtractSliceOp>(op)) {
-    return true;
-  }
-  // add matmul link by L0C
-  if (auto nextDot = dyn_cast<linalg::MatmulOp>(op)) {
-    if (nextDot.getDpsInits()[0] == *preDot->getResults().begin()) {
-      preDot = nextDot;
-      return true;
-    }
-    return false;
-  }
-  return false;
+static bool checkValidUserSeed(Operation *op) {
+  return isa<hivm::StoreOp, bufferization::MaterializeInDestinationOp,
+             ViewLikeOpInterface, tensor::ExtractSliceOp>(op);
 }
+
 static SmallVector<Operation *>
 matchSeed(Operation *dotOp, ComputeBlockIdManager &bm,
           const MemoryDependenceGraph &memGraph,
@@ -484,14 +473,13 @@ matchSeed(Operation *dotOp, ComputeBlockIdManager &bm,
   }
   // match outputs
   Operation *nowOp = dotOp;
-  linalg::MatmulOp linkMatmul = llvm::dyn_cast<linalg::MatmulOp>(dotOp);
   while (nowOp->hasOneUse()) {
     auto user = *nowOp->getUsers().begin();
     if (user->getBlock() != dotOp->getBlock() || !isCubeSimpleOpOrCf(user) ||
         bm.getBlockIdByOp(user) != -1) {
       break;
     }
-    if (checkValidUserSeed(user, linkMatmul)) {
+    if (checkValidUserSeed(user)) {
       nowOp = user;
       ret.push_back(user);
     } else {

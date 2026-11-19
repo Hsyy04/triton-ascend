@@ -25,6 +25,7 @@
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "third_party/ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
@@ -350,6 +351,32 @@ int initCrossCoreDependentMap(ModuleOp module, ControlFlowConditionInfo *info) {
   return 0;
 }
 
+// A cross-block matmul init shares one loop-carried L0C value. Model its
+// producer as a single slot so the next iteration cannot overwrite it before
+// the consumer executes.
+static void collectCrossBlockAccumulatorDeps(
+    Operation *loop,
+    llvm::DenseMap<Operation *, SmallVector<Operation *>> &depMap) {
+  for (auto consumerIf : MainLoop(loop).getBody()->getOps<scf::IfOp>()) {
+    if (!consumerIf->hasAttr(kIf))
+      continue;
+    for (auto consumer : consumerIf.thenBlock()->getOps<linalg::MatmulOp>()) {
+      auto init = dyn_cast<OpResult>(consumer.getDpsInitOperand(0)->get());
+      if (!init)
+        continue;
+      auto producerIf = dyn_cast<scf::IfOp>(init.getOwner());
+      if (!producerIf || !producerIf->hasAttr(kIf) ||
+          producerIf->getBlock() != consumerIf->getBlock())
+        continue;
+      auto producer = producerIf.thenYield()
+                          .getOperand(init.getResultNumber())
+                          .getDefiningOp<linalg::MatmulOp>();
+      if (producer && producer->getBlock() == producerIf.thenBlock())
+        depMap[consumer].push_back(producer);
+    }
+  }
+}
+
 // Initializes intraCoreDependentMap: per main_loop op (scf.for/scf.while) keeps
 // consumers inside it but not in nested mainloops. 0 on success, -1 on error.
 int initIntraCoreDependentMap(ModuleOp module, ControlFlowConditionInfo *info) {
@@ -382,6 +409,8 @@ int initIntraCoreDependentMap(ModuleOp module, ControlFlowConditionInfo *info) {
       ret = -1;
       return;
     }
+
+    collectCrossBlockAccumulatorDeps(op, depMap);
 
     // Only insert if there are dependencies for this mainLoop
     if (!depMap.empty()) {
